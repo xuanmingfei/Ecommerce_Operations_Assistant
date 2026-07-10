@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>电商运营助手</title>
+  <link rel="stylesheet" href="/static/样式.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div>
+        <h1>电商运营助手</h1>
+      </div>
+      <div class="top-actions">
+        <select id="rootCategoryFilter">
+          <option value="">全部类目</option>
+        </select>
+        <button id="knowledgeBtn">知识库</button>
+      </div>
+    </header>
+    <div id="toastBox" class="toast-box"></div>
+
+    <section class="summary-grid">
+      <article>
+        <span>原始文件</span>
+        <strong id="fileCount">0</strong>
+      </article>
+      <article>
+        <span>分析结论</span>
+        <strong id="analysisCount">0</strong>
+      </article>
+      <article>
+        <span>商家资源</span>
+        <strong id="merchantCount">0</strong>
+      </article>
+      <article>
+        <span id="categoryCountLabel">类目树</span>
+        <strong id="categoryCount">0</strong>
+      </article>
+    </section>
+
+    <section class="layout">
+      <section class="left-pane">
+        <div class="panel calendar-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">日历</p>
+              <h2 id="calendarTitle">日历</h2>
+            </div>
+            <div class="month-controls">
+              <button id="prevMonth" title="上个月">‹</button>
+              <button id="todayMonth">今天</button>
+              <button id="nextMonth" title="下个月">›</button>
+            </div>
+          </div>
+          <div class="weekdays">
+            <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+          </div>
+          <div id="calendarGrid" class="calendar-grid"></div>
+        </div>
+      </section>
+
+      <section class="chat-pane panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">AI 助手</p>
+            <h2>问商品、问商家、问备货</h2>
+          </div>
+        </div>
+        <div id="chatMessages" class="chat-messages">
+          <div class="bubble assistant">你可以问：“泳池过滤器什么时候备货？”或“我缺冬季庭院商品，有哪些商家可找？”</div>
+        </div>
+        <form id="chatForm" class="chat-form">
+          <input id="chatInput" placeholder="输入你的问题..." autocomplete="off">
+          <button>发送</button>
+        </form>
+      </section>
+
+      <aside class="reminder-pane panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">自动生成</p>
+            <h2>备货提醒列表</h2>
+          </div>
+        </div>
+        <div id="reminderList" class="reminder-list"></div>
+      </aside>
+
+      <section class="analysis-pane panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">销售高峰</p>
+            <h2>阶段性分析结论</h2>
+          </div>
+          <div class="panel-controls">
+            <select id="homeCountryFilter">
+              <option value="">全部国家</option>
+            </select>
+            <select id="yearFilter">
+              <option value="">全部年份</option>
+            </select>
+          </div>
+        </div>
+        <div id="analysisList" class="analysis-list"></div>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="knowledgeDialog">
+    <div class="dialog-head">
+      <div>
+        <p class="eyebrow">本地知识库</p>
+        <h2>四类知识库</h2>
+      </div>
+      <button id="closeKnowledge">关闭</button>
+    </div>
+    <div class="tabs">
+      <button data-tab="raw" class="active">原始数据库</button>
+      <button data-tab="analysis">分析结论库</button>
+      <button data-tab="merchant">商家资源库</button>
+      <button data-tab="wisdom">运营智慧库</button>
+      <button data-tab="holiday">节日日历</button>
+    </div>
+    <section id="tabRaw" class="tab-content active">
+      <div class="raw-upload">
+        <select id="rawUploadCountry" required></select>
+        <input id="rawUploadCountryManual" placeholder="手动输入国家">
+        <input id="rawUploadFile" type="file" accept=".xlsx,.xls,.csv" multiple>
+        <button id="rawUploadBtn" type="button">上传并分析</button>
+      </div>
+      <div id="uploadProgress" class="upload-progress" hidden>
+        <div><span id="uploadProgressText">准备上传</span></div>
+        <div class="progress-track"><div id="uploadProgressBar"></div></div>
+      </div>
+      <div id="rawContent"></div>
+    </section>
+    <section id="tabAnalysis" class="tab-content">
+      <div id="analysisFilters" class="filter-row"></div>
+      <div id="analysisTable"></div>
+    </section>
+    <section id="tabMerchant" class="tab-content">
+      <div class="bulk-tools">
+        <select id="merchantImportCountry"></select>
+        <input id="merchantImportCountryManual" placeholder="批量导入国家">
+        <button id="downloadMerchantTemplate" type="button">下载模板</button>
+        <label class="secondary-upload">
+          批量导入商家
+          <input id="merchantImportFile" type="file" accept=".xlsx,.xls,.csv">
+        </label>
+        <p id="merchantImportResult" class="small"></p>
+      </div>
+      <form id="merchantForm" class="merchant-form">
+        <select id="merchantCountry" required></select>
+        <input id="merchantCountryManual" placeholder="新增国家">
+        <input id="merchantSeller" placeholder="店铺名字" required>
+        <input id="merchantCompany" placeholder="公司名称">
+        <input id="merchantContact" placeholder="联系电话">
+        <input id="merchantEmail" placeholder="邮箱">
+        <input id="merchantAddress" placeholder="经营地址">
+        <select id="merchantCategory" required></select>
+        <input id="merchantNotes" placeholder="备注">
+        <button>添加商家</button>
+      </form>
+      <div id="merchantFilters" class="filter-row"></div>
+      <div id="merchantTable"></div>
+    </section>
+    <section id="tabWisdom" class="tab-content">
+      <div id="wisdomFilters" class="filter-row"></div>
+      <form id="wisdomForm" class="wisdom-form">
+        <input type="hidden" id="wisdomId">
+        <input id="wisdomTitle" placeholder="标题，例如：喂鸟器冬季反常识高峰">
+        <select id="wisdomCategory"></select>
+        <textarea id="wisdomContent" placeholder="写入你人工深挖出的结论..."></textarea>
+        <div class="edit-actions">
+          <button id="wisdomSubmitBtn">写入运营智慧库</button>
+          <button type="button" id="cancelWisdomEdit" class="secondary" hidden>取消</button>
+        </div>
+      </form>
+      <div id="wisdomList"></div>
+    </section>
+    <section id="tabHoliday" class="tab-content">
+      <form id="holidayForm" class="wisdom-form">
+        <input type="hidden" id="holidayId">
+        <select id="holidayCountry" required></select>
+        <input id="holidayName" placeholder="节日名称，例如：感恩节" required>
+        <input id="holidayLocalName" placeholder="当地名称，可选">
+        <input id="holidayRule" placeholder="日期规则，例如：11月第4个星期四 / 10月3日" required>
+        <label class="check-line"><input id="holidayFloating" type="checkbox"> 浮动日期</label>
+        <textarea id="holidayNote" placeholder="消费习惯/备注，例如：黑五前奏，庭院/厨房用品热卖"></textarea>
+        <div class="edit-actions">
+          <button id="holidaySubmitBtn">新增节日</button>
+          <button type="button" id="cancelHolidayEdit" class="secondary" hidden>取消</button>
+        </div>
+      </form>
+      <div id="holidayList"></div>
+    </section>
+  </dialog>
+
+  <dialog id="merchantDialog">
+    <div class="dialog-head">
+      <div>
+        <p class="eyebrow">商家资源库</p>
+        <h2>编辑商家</h2>
+      </div>
+      <button id="closeMerchantDialog">关闭</button>
+    </div>
+    <form id="merchantEditForm" class="merchant-form edit-form">
+      <input type="hidden" id="editMerchantId">
+      <input id="editCountry" placeholder="国家" disabled>
+      <input id="editSeller" placeholder="店铺名字" required>
+      <input id="editCompany" placeholder="公司名称">
+      <input id="editContact" placeholder="联系电话">
+      <input id="editEmail" placeholder="邮箱">
+      <input id="editAddress" placeholder="经营地址">
+      <select id="editCategory" required></select>
+      <input id="editNotes" placeholder="备注">
+      <div class="edit-actions">
+        <button>保存修改</button>
+        <button type="button" id="deleteMerchantBtn" class="danger">删除</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/交互.js"></script>
+</body>
+</html>
