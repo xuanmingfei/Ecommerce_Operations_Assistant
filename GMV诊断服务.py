@@ -26,6 +26,7 @@ from 分析引擎 import (
     import_sales_file,
     import_translation_file,
     local_chat_answer,
+    month_key,
     rebuild_analysis,
     seed_initial_data,
     update_holiday_rule,
@@ -208,12 +209,15 @@ class Handler(BaseHTTPRequestHandler):
                 tmp_path.replace(target)
                 result = import_sales_file(target, country=country, source_copy=True)
                 if result.get("ok"):
-                    rebuild_result = rebuild_analysis(start_month, end_month, country=result.get("country"))
+                    uploaded_month = month_key(result["year"], result["month"]) if result.get("year") and result.get("month") else ""
+                    analysis_start = start_month or uploaded_month
+                    analysis_end = end_month or uploaded_month
+                    rebuild_result = rebuild_analysis(analysis_start, analysis_end, country=result.get("country"))
                     result.update({k: v for k, v in rebuild_result.items() if k in ("time_range_start", "time_range_end")})
                     result["notifications"] = build_analysis_notifications(
                         result.get("country"),
-                        result.get("time_range_start") or start_month,
-                        result.get("time_range_end") or end_month,
+                        result.get("time_range_start") or analysis_start,
+                        result.get("time_range_end") or analysis_end,
                         result.get("categories", []),
                     )
                 self.send_json(result)
