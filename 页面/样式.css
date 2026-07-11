@@ -46,6 +46,11 @@ button:hover { filter: brightness(1.05); }
 h1, h2, p { margin: 0; }
 h1 { font-size: 34px; letter-spacing: 0; color: var(--orange); }
 h2 { font-size: 18px; letter-spacing: 0; }
+.app-subtitle {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 14px;
+}
 .eyebrow {
   color: var(--muted);
   font-size: 13px;
