@@ -47,7 +47,14 @@ function currencySymbol(country) {
 }
 
 function rowTimeRange(row) {
-  return row.time_range_label || `${row.time_range_start || ""} 至 ${row.time_range_end || ""}`;
+  if (row.time_range_label) return row.time_range_label;
+  if (row.time_range_start && row.time_range_end) return `${row.time_range_start} 至 ${row.time_range_end}`;
+  if (row.year) return `${row.year}-01 至 ${row.year}-12`;
+  return "未标注时间范围";
+}
+
+function timeRangeOptions(rows) {
+  return Array.from(new Set((rows || []).map(rowTimeRange).filter(Boolean))).sort((a, b) => b.localeCompare(a));
 }
 
 function monthText(item) {
@@ -115,7 +122,7 @@ function renderAll() {
   document.getElementById("categoryCountLabel").textContent = filters.rootCategory ? `${filters.rootCategory}类目树` : "类目树";
   renderRootFilter();
   renderHomeCountryFilter();
-  renderYearFilter();
+  renderTimeRangeFilter();
   renderCalendar();
   renderAnalysis();
   renderReminders();
@@ -155,12 +162,13 @@ function renderHomeCountryFilter() {
   filters.homeCountry = select.value;
 }
 
-function renderYearFilter() {
-  const select = document.getElementById("yearFilter");
-  const years = Array.from(new Set(analysisForPanel().map(item => item.year))).sort((a, b) => b - a);
-  const current = select.value;
-  select.innerHTML = `<option value="">全部年份</option>` + years.map(y => `<option value="${y}">${y} 年</option>`).join("");
+function renderTimeRangeFilter() {
+  const select = document.getElementById("timeRangeFilter");
+  const current = filters.homeTimeRange || select.value;
+  const ranges = timeRangeOptions(analysisForPanel());
+  select.innerHTML = `<option value="">全部时间范围</option>` + ranges.map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
   select.value = current;
+  filters.homeTimeRange = select.value;
 }
 
 function renderCalendar() {
@@ -187,9 +195,9 @@ function renderReminders() {
 }
 
 function renderAnalysis() {
-  const year = document.getElementById("yearFilter").value;
+  const timeRange = filters.homeTimeRange;
   const list = document.getElementById("analysisList");
-  const items = analysisForPanel().filter(item => !year || String(item.year) === year).slice(0, 36);
+  const items = analysisForPanel().filter(item => !timeRange || rowTimeRange(item) === timeRange).slice(0, 36);
   list.innerHTML = items.map(renderAnalysisCard).join("") || `<p class="small">暂无分析结论。</p>`;
 }
 
@@ -209,7 +217,7 @@ function renderAnalysisCard(item) {
           <h3>${escapeHtml(item.category_name_zh)}</h3>
           <p class="small">${escapeHtml(item.country)}｜原始类目：${escapeHtml(item.category_key)}</p>
         </div>
-        <span class="small">${item.year}</span>
+        <span class="small">${escapeHtml(rowTimeRange(item))}</span>
       </header>
       <div class="metrics">
         <span class="metric">高峰：${peakText(item.peak_months)}</span>
@@ -284,11 +292,17 @@ function renderKnowledgeFilters(kind) {
   const categoryKey = `${kind}Category`;
   const categories = getCategoriesForKind(kind);
   const categoryLabel = kind === "wisdom" ? "全部一级类目" : "全部三级类目";
+  const timeRangeSelect = kind === "analysis" ? `
+    <select data-filter="analysisTimeRange">
+      <option value="">全部时间范围</option>
+      ${timeRangeOptions(state.analysis).map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}
+    </select>` : "";
   container.innerHTML = `
     <select data-filter="${countryKey}">
       <option value="">全部国家</option>
       ${sortCountries(state.countries).map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
     </select>
+    ${timeRangeSelect}
     <select data-filter="${categoryKey}">
       <option value="">${categoryLabel}</option>
       ${categories.map(c => `<option value="${escapeHtml(c.key)}">${escapeHtml(c.name)}｜${escapeHtml(c.key)}</option>`).join("")}
@@ -296,6 +310,8 @@ function renderKnowledgeFilters(kind) {
     ${kind === "merchant" ? `<input data-filter="merchantKeyword" placeholder="搜索店铺/公司名称">` : ""}`;
   container.querySelector(`[data-filter="${countryKey}"]`).value = filters[countryKey] || "";
   container.querySelector(`[data-filter="${categoryKey}"]`).value = filters[categoryKey] || "";
+  const timeRange = container.querySelector('[data-filter="analysisTimeRange"]');
+  if (timeRange) timeRange.value = filters.analysisTimeRange || "";
   const keyword = container.querySelector('[data-filter="merchantKeyword"]');
   if (keyword) keyword.value = filters.merchantKeyword || "";
 }
@@ -388,9 +404,12 @@ function matchesCategoryCascade(row, kind) {
 function filterRows(rows, kind) {
   const country = filters[`${kind}Country`];
   const category = filters[`${kind}Category`];
+  const timeRange = kind === "analysis" ? filters.analysisTimeRange : "";
   const keyword = String(filters.merchantKeyword || "").trim().toLowerCase();
   return rows.filter(row => {
-    const baseOk = (!country || row.country === country) && (!category || row.category_key === category);
+    const baseOk = (!country || row.country === country) &&
+      (!category || row.category_key === category) &&
+      (!timeRange || rowTimeRange(row) === timeRange);
     if (!baseOk) return false;
     if (kind !== "merchant" || !keyword) return true;
     return String(row.seller_name || "").toLowerCase().includes(keyword) || String(row.company_name || "").toLowerCase().includes(keyword);
@@ -405,7 +424,7 @@ function renderAnalysisTable() {
         const symbol = currencySymbol(item.country);
         return `<div class="row">
         <span>${escapeHtml(item.country)}｜${escapeHtml(item.category_name_zh)}<br><small>${escapeHtml(item.category_key)}</small></span>
-        <span>${item.year} 年<br>高峰 ${escapeHtml(peakText(item.peak_months))}</span>
+        <span>${escapeHtml(rowTimeRange(item))}<br>高峰 ${escapeHtml(peakText(item.peak_months))}</span>
         <span>${symbol}${item.price_low.toFixed(2)} - ${symbol}${item.price_high.toFixed(2)}</span>
         <span>${escapeHtml(item.completeness_note || "")}</span>
         <span></span>
@@ -505,10 +524,13 @@ function escapeHtml(text) {
 document.getElementById("prevMonth").addEventListener("click", () => { viewDate.setMonth(viewDate.getMonth() - 1); loadState(); });
 document.getElementById("nextMonth").addEventListener("click", () => { viewDate.setMonth(viewDate.getMonth() + 1); loadState(); });
 document.getElementById("todayMonth").addEventListener("click", () => { viewDate = new Date(); loadState(); });
-document.getElementById("yearFilter").addEventListener("change", renderAnalysis);
+document.getElementById("timeRangeFilter").addEventListener("change", event => {
+  filters.homeTimeRange = event.target.value;
+  renderAnalysis();
+});
 document.getElementById("homeCountryFilter").addEventListener("change", event => {
   filters.homeCountry = event.target.value;
-  renderYearFilter();
+  renderTimeRangeFilter();
   renderAnalysis();
 });
 document.getElementById("rootCategoryFilter").addEventListener("change", event => {
