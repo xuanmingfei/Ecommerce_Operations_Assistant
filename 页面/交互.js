@@ -25,6 +25,22 @@ const filters = {
 };
 
 const fmt = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 });
+const zhPinyinCollator = new Intl.Collator("zh-Hans-CN-u-co-pinyin", { numeric: true, sensitivity: "base" });
+
+function sortNames(values) {
+  return Array.from(values || []).filter(Boolean).sort((a, b) => zhPinyinCollator.compare(String(a), String(b)));
+}
+
+function sortCountries(values) {
+  return sortNames(values);
+}
+
+function sortCategoryOptions(options) {
+  return Array.from(options || []).sort((a, b) => {
+    const byName = zhPinyinCollator.compare(String(a.name || a.key || ""), String(b.name || b.key || ""));
+    return byName || zhPinyinCollator.compare(String(a.key || ""), String(b.key || ""));
+  });
+}
 
 function currencySymbol(country) {
   return country === "美国" ? "$" : country === "英国" ? "£" : "€";
@@ -126,14 +142,14 @@ function filteredFilesForHome() {
 function renderRootFilter() {
   const select = document.getElementById("rootCategoryFilter");
   const current = filters.rootCategory;
-  select.innerHTML = `<option value="">全部类目</option>` + (state.category_roots || []).map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
+  select.innerHTML = `<option value="">全部类目</option>` + sortNames(state.category_roots).map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
   select.value = current;
 }
 
 function renderHomeCountryFilter() {
   const select = document.getElementById("homeCountryFilter");
   const current = filters.homeCountry;
-  const countries = Array.from(new Set(filteredAnalysisForHome().map(item => item.country).filter(Boolean))).sort((a, b) => a.localeCompare(b, "zh-CN"));
+  const countries = sortCountries(new Set(filteredAnalysisForHome().map(item => item.country).filter(Boolean)));
   select.innerHTML = `<option value="">全部国家</option>` + countries.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
   select.value = current;
   filters.homeCountry = select.value;
@@ -217,10 +233,11 @@ function renderKnowledge() {
 }
 
 function renderRawTable() {
-  const countries = Array.from(new Set(state.files.map(file => file.country).filter(Boolean))).sort((a, b) => a.localeCompare(b, "zh-CN"));
+  const countries = sortCountries(new Set(state.files.map(file => file.country).filter(Boolean)));
   const years = Array.from(new Set(state.files.map(file => file.year).filter(Boolean))).sort((a, b) => b - a);
   const categories = new Map();
   state.files.forEach(file => (file.category_keys || []).forEach((key, index) => categories.set(key, (file.category_names_zh || [])[index] || key)));
+  const categoryOptions = sortCategoryOptions(Array.from(categories.entries()).map(([key, name]) => ({ key, name })));
   const rows = state.files.filter(file => {
     const categoryOk = !filters.rawCategory || (file.category_keys || []).includes(filters.rawCategory);
     return (!filters.rawCountry || file.country === filters.rawCountry) &&
@@ -235,7 +252,7 @@ function renderRawTable() {
       </select>
       <select data-filter="rawCategory">
         <option value="">全部三级类目</option>
-        ${Array.from(categories.entries()).map(([key, name]) => `<option value="${escapeHtml(key)}">${escapeHtml(name)}｜${escapeHtml(key)}</option>`).join("")}
+        ${categoryOptions.map(c => `<option value="${escapeHtml(c.key)}">${escapeHtml(c.name)}｜${escapeHtml(c.key)}</option>`).join("")}
       </select>
       <select data-filter="rawYear">
         <option value="">全部年份</option>
@@ -270,7 +287,7 @@ function renderKnowledgeFilters(kind) {
   container.innerHTML = `
     <select data-filter="${countryKey}">
       <option value="">全部国家</option>
-      ${state.countries.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
+      ${sortCountries(state.countries).map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
     </select>
     <select data-filter="${categoryKey}">
       <option value="">${categoryLabel}</option>
@@ -294,13 +311,13 @@ function getCategoriesForKind(kind) {
   if (kind === "analysis") rows = state.analysis;
   if (kind === "merchant") rows = state.merchants;
   if (kind === "wisdom") {
-    return (state.category_roots || []).map(name => ({ key: name, name }));
+    return sortCategoryOptions((state.category_roots || []).map(name => ({ key: name, name })));
   }
   const map = new Map();
   rows.forEach(row => {
     if (row.category_key) map.set(row.category_key, row.category_name_zh || row.category_key);
   });
-  return Array.from(map.entries()).map(([key, name]) => ({ key, name })).sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+  return sortCategoryOptions(Array.from(map.entries()).map(([key, name]) => ({ key, name })));
 }
 
 function uniqueCategoryValues(rows, field, parents = {}) {
@@ -311,7 +328,7 @@ function uniqueCategoryValues(rows, field, parents = {}) {
     const value = row[field];
     if (value) values.add(value);
   });
-  return Array.from(values).sort((a, b) => a.localeCompare(b, "zh-CN"));
+  return sortNames(values);
 }
 
 function cascadeSelectHtml(kind, rows) {
@@ -444,7 +461,7 @@ function renderHolidayTable() {
 }
 
 function fillFormOptions() {
-  const countryOptions = label => `<option value="">${label}</option>` + state.countries.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+  const countryOptions = label => `<option value="">${label}</option>` + sortCountries(state.countries).map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
   const countrySelects = [
     ["rawUploadCountry", "选择数据归属国家"],
     ["merchantCountry", "国家"],
@@ -458,10 +475,10 @@ function fillFormOptions() {
     el.innerHTML = countryOptions(label);
     el.value = current;
   });
-  const categoryOptions = `<option value="">主营三级类目</option>` + state.categories.map(c => `<option value="${escapeHtml(c.key)}">${escapeHtml(c.name)}｜${escapeHtml(c.key)}</option>`).join("");
+  const categoryOptions = `<option value="">主营三级类目</option>` + sortCategoryOptions(state.categories).map(c => `<option value="${escapeHtml(c.key)}">${escapeHtml(c.name)}｜${escapeHtml(c.key)}</option>`).join("");
   document.getElementById("merchantCategory").innerHTML = categoryOptions;
   document.getElementById("editCategory").innerHTML = categoryOptions;
-  const wisdomCategoryOptions = `<option value="">无类目</option>` + (state.category_roots || []).map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
+  const wisdomCategoryOptions = `<option value="">无类目</option>` + sortNames(state.category_roots).map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
   document.getElementById("wisdomCategory").innerHTML = wisdomCategoryOptions;
   fillAnalysisRangeDefaults();
 }
