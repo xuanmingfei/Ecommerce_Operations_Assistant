@@ -214,14 +214,6 @@ def init_db():
         ensure_column(conn, "merchant_resources", "category_l3_zh", "TEXT DEFAULT ''")
         conn.execute("UPDATE wisdom SET updated_at=created_at WHERE COALESCE(updated_at, '')=''")
         conn.execute("UPDATE analysis_conclusions SET source='销售数据' WHERE COALESCE(source, '')=''")
-        conn.execute(
-            """
-            UPDATE analysis_conclusions
-            SET time_range_start=printf('%04d-01', year),
-                time_range_end=printf('%04d-12', year)
-            WHERE COALESCE(time_range_start, '')='' AND COALESCE(time_range_end, '')='' AND COALESCE(year, 0) > 0
-            """
-        )
 
 
 def ensure_column(conn, table, column, definition):
@@ -276,16 +268,8 @@ def migrate_analysis_conclusions(conn):
     def expr(column, fallback):
         return column if column in columns else fallback
 
-    time_start = (
-        "COALESCE(NULLIF(time_range_start, ''), printf('%04d-01', year))"
-        if "time_range_start" in columns
-        else "printf('%04d-01', year)"
-    )
-    time_end = (
-        "COALESCE(NULLIF(time_range_end, ''), printf('%04d-12', year))"
-        if "time_range_end" in columns
-        else "printf('%04d-12', year)"
-    )
+    time_start = "time_range_start" if "time_range_start" in columns else "''"
+    time_end = "time_range_end" if "time_range_end" in columns else "''"
     conn.execute(
         f"""
         INSERT INTO analysis_conclusions_new(
