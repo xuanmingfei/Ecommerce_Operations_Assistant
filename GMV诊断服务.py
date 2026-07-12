@@ -21,6 +21,7 @@ from 分析引擎 import (
     delete_merchant,
     delete_wisdom,
     export_translation_terms,
+    get_analysis_range,
     get_state,
     import_merchants_file,
     import_sales_file,
@@ -99,6 +100,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             qs = parse_qs(parsed.query)
             self.send_json(get_state(qs.get("year", [None])[0], qs.get("month", [None])[0]))
+            return
+        if path == "/api/analysis":
+            qs = parse_qs(parsed.query)
+            self.send_json(get_analysis_range(qs.get("start", [None])[0], qs.get("end", [None])[0]))
             return
         if path == "/api/merchant/template":
             self.send_csv_download([["店铺名字", "公司名称", "联系电话", "邮箱", "经营地址", "主营三级类目", "备注"]], "商家批量导入模板.csv")

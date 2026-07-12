@@ -63,6 +63,38 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_sales_category
             ON sales_rows(country, year, minor_category);
 
+            CREATE INDEX IF NOT EXISTS idx_sales_country_category_month
+            ON sales_rows(country, category_l3_zh, year, month);
+
+            CREATE INDEX IF NOT EXISTS idx_sales_country_minor_month
+            ON sales_rows(country, minor_category, year, month);
+
+            CREATE INDEX IF NOT EXISTS idx_sales_country_month_seller
+            ON sales_rows(country, year, month, seller);
+
+            CREATE TABLE IF NOT EXISTS monthly_category_sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                country TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                month INTEGER NOT NULL,
+                category_key TEXT NOT NULL,
+                category_path TEXT DEFAULT '',
+                category_l1_zh TEXT DEFAULT '',
+                category_l2_zh TEXT DEFAULT '',
+                category_l3_zh TEXT DEFAULT '',
+                sample_rows INTEGER DEFAULT 0,
+                sales REAL DEFAULT 0,
+                units REAL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                UNIQUE(country, year, month, category_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_monthly_country_category_month
+            ON monthly_category_sales(country, category_key, year, month);
+
+            CREATE INDEX IF NOT EXISTS idx_monthly_country_month
+            ON monthly_category_sales(country, year, month);
+
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 zh_cate2 TEXT,
@@ -159,6 +191,12 @@ def init_db():
                 updated_at TEXT NOT NULL,
                 UNIQUE(country, category_key, seller_name)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_analysis_country_category_range
+            ON analysis_conclusions(country, category_key, time_range_start, time_range_end);
+
+            CREATE INDEX IF NOT EXISTS idx_merchants_country_category_sales
+            ON merchant_resources(country, category_key, sales);
 
             CREATE TABLE IF NOT EXISTS wisdom (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

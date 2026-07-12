@@ -3,9 +3,11 @@ import csv
 import json
 import re
 import shutil
+import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -20,6 +22,7 @@ COUNTRY_CODES = {value: key for key, value in COUNTRIES.items()}
 SUPPORTED_COUNTRIES = ["德国", "西班牙", "美国"]
 SALES_FIELDS = ["月销售额(€)", "月销售额($)", "月销售额(£)", "月销售额", "Monthly Sales", "Monthly Revenue"]
 PRICE_FIELDS = ["价格(€)", "价格($)", "价格(£)", "价格", "Price"]
+ANALYSIS_RANGE_CACHE = {"key": None, "value": None}
 
 
 def currency_symbol(country):
@@ -158,6 +161,11 @@ CATEGORY_TREE_CACHE = None
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def clear_analysis_cache():
+    ANALYSIS_RANGE_CACHE["key"] = None
+    ANALYSIS_RANGE_CACHE["value"] = None
 
 
 def reset_translation_cache():
@@ -675,6 +683,7 @@ def import_sales_file(path, country=None, source_copy=False):
             (str(import_path),),
         ).fetchone()
         if existing and (existing["imported_rows"] or 0) >= len(parsed_rows):
+            refresh_monthly_summary(conn, country, year, month)
             return {"ok": True, "message": f"已存在同名文件且样本数不少于当前文件：{import_path.name}", "file_id": existing["id"], "country": country, "year": year, "month": month, "categories": category_keys}
         if existing:
             conn.execute("DELETE FROM sales_rows WHERE file_id=?", (existing["id"],))
@@ -699,7 +708,75 @@ def import_sales_file(path, country=None, source_copy=False):
             """,
             [row + (file_id,) for row in parsed_rows],
         )
+        refresh_monthly_summary(conn, country, year, month)
     return {"ok": True, "message": f"导入 {country} {import_path.name}：{len(parsed_rows)} 条数据", "file_id": file_id, "country": country, "year": year, "month": month, "categories": category_keys}
+
+
+def refresh_monthly_summary(conn, country, year, month):
+    conn.execute(
+        "DELETE FROM monthly_category_sales WHERE country=? AND year=? AND month=?",
+        (country, int(year), int(month)),
+    )
+    conn.execute(
+        """
+        INSERT INTO monthly_category_sales(
+            country, year, month, category_key, category_path,
+            category_l1_zh, category_l2_zh, category_l3_zh,
+            sample_rows, sales, units, updated_at
+        )
+        SELECT country, year, month,
+               COALESCE(NULLIF(category_l3_zh, ''), minor_category) AS category_key,
+               COALESCE(MAX(category_path), '') AS category_path,
+               COALESCE(MAX(category_l1_zh), '') AS category_l1_zh,
+               COALESCE(MAX(category_l2_zh), '') AS category_l2_zh,
+               COALESCE(MAX(category_l3_zh), '') AS category_l3_zh,
+               COUNT(*) AS sample_rows,
+               SUM(sales) AS sales,
+               SUM(units) AS units,
+               ?
+        FROM sales_rows
+        WHERE country=? AND year=? AND month=?
+          AND COALESCE(NULLIF(category_l3_zh, ''), minor_category) <> ''
+        GROUP BY country, year, month, COALESCE(NULLIF(category_l3_zh, ''), minor_category)
+        """,
+        (now_text(), country, int(year), int(month)),
+    )
+
+
+def rebuild_monthly_summary():
+    with get_conn() as conn:
+        conn.execute("DELETE FROM monthly_category_sales")
+        conn.execute(
+            """
+            INSERT INTO monthly_category_sales(
+                country, year, month, category_key, category_path,
+                category_l1_zh, category_l2_zh, category_l3_zh,
+                sample_rows, sales, units, updated_at
+            )
+            SELECT country, year, month,
+                   COALESCE(NULLIF(category_l3_zh, ''), minor_category) AS category_key,
+                   COALESCE(MAX(category_path), '') AS category_path,
+                   COALESCE(MAX(category_l1_zh), '') AS category_l1_zh,
+                   COALESCE(MAX(category_l2_zh), '') AS category_l2_zh,
+                   COALESCE(MAX(category_l3_zh), '') AS category_l3_zh,
+                   COUNT(*) AS sample_rows,
+                   SUM(sales) AS sales,
+                   SUM(units) AS units,
+                   ?
+            FROM sales_rows
+            WHERE COALESCE(NULLIF(category_l3_zh, ''), minor_category) <> ''
+            GROUP BY country, year, month, COALESCE(NULLIF(category_l3_zh, ''), minor_category)
+            """,
+            (now_text(),),
+        )
+
+
+def ensure_monthly_summary():
+    with get_conn() as conn:
+        sales_count = conn.execute("SELECT COUNT(*) AS n FROM sales_rows").fetchone()["n"]
+        summary_count = conn.execute("SELECT COUNT(*) AS n FROM monthly_category_sales").fetchone()["n"]
+    if sales_count and not summary_count:
+        rebuild_monthly_summary()
 
 
 def normalize_existing_sales_categories():
@@ -912,7 +989,9 @@ def seed_initial_data():
         analysis_count = conn.execute("SELECT COUNT(*) AS n FROM analysis_conclusions").fetchone()["n"]
     if sales_count and not analysis_count:
         normalize_existing_sales_categories()
+        rebuild_monthly_summary()
         rebuild_analysis()
+    ensure_monthly_summary()
 
 
 def rebuild_analysis(start_month=None, end_month=None, country=None):
@@ -946,20 +1025,20 @@ def rebuild_analysis(start_month=None, end_month=None, country=None):
         grouped = conn.execute(
             f"""
             SELECT country, year,
-                   COALESCE(NULLIF(category_l3_zh, ''), minor_category) AS category_key,
+                   category_key,
                    COALESCE(MAX(category_l1_zh), '') AS category_l1_zh,
                    COALESCE(MAX(category_l2_zh), '') AS category_l2_zh,
                    COALESCE(MAX(category_l3_zh), '') AS category_l3_zh,
                    COALESCE(MAX(category_path), '') AS category_path,
                    month,
-                   COUNT(*) AS sample_rows,
+                   SUM(sample_rows) AS sample_rows,
                    SUM(sales) AS sales,
                    SUM(units) AS units
-            FROM sales_rows
-            WHERE COALESCE(NULLIF(category_l3_zh, ''), minor_category) <> ''
+            FROM monthly_category_sales
+            WHERE category_key <> ''
               AND (year * 100 + month) BETWEEN ? AND ?
               {country_clause}
-            GROUP BY country, year, month, COALESCE(NULLIF(category_l3_zh, ''), minor_category)
+            GROUP BY country, year, month, category_key
             """,
             params,
         ).fetchall()
@@ -1056,6 +1135,7 @@ def rebuild_analysis(start_month=None, end_month=None, country=None):
                     """,
                     (country, category_key, seller["seller"], seller["seller_location"], seller["seller_info"], seller["seller_home"], seller["sales"] or 0, seller["units"] or 0, now_text(), category_l1_zh, category_l2_zh, category_l3_zh or category_key),
                 )
+        clear_analysis_cache()
         return {"ok": True, "country": country, "time_range_start": start_month, "time_range_end": end_month, "categories": changed_categories}
 
 
@@ -1268,6 +1348,42 @@ def decode_row(row):
     return row
 
 
+def get_analysis_range(start_month=None, end_month=None):
+    start_month = normalize_month(start_month)
+    end_month = normalize_month(end_month)
+    with get_conn() as conn:
+        if not start_month or not end_month:
+            start_month, end_month = resolve_analysis_range(conn, start_month, end_month)
+        if not start_month or not end_month:
+            return {"analysis": [], "time_range_start": "", "time_range_end": "", "cache": "miss"}
+        if month_int(start_month) > month_int(end_month):
+            start_month, end_month = end_month, start_month
+        cache_key = (start_month, end_month)
+        if ANALYSIS_RANGE_CACHE["key"] == cache_key:
+            result = dict(ANALYSIS_RANGE_CACHE["value"])
+            result["cache"] = "hit"
+            return result
+        rows = [
+            decode_row(r)
+            for r in conn.execute(
+                """
+                SELECT *
+                FROM analysis_conclusions
+                WHERE COALESCE(time_range_start, '') <> ''
+                  AND COALESCE(time_range_end, '') <> ''
+                  AND time_range_start <= ?
+                  AND time_range_end >= ?
+                ORDER BY time_range_end DESC, time_range_start DESC, avg_sales DESC
+                """,
+                (end_month, start_month),
+            )
+        ]
+    result = {"analysis": rows, "time_range_start": start_month, "time_range_end": end_month, "cache": "miss"}
+    ANALYSIS_RANGE_CACHE["key"] = cache_key
+    ANALYSIS_RANGE_CACHE["value"] = result
+    return result
+
+
 def get_state(year=None, month=None):
     today = date.today()
     year = int(year or today.year)
@@ -1372,6 +1488,7 @@ def delete_wisdom(wisdom_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM wisdom WHERE id=?", (int(wisdom_id),))
         conn.execute("DELETE FROM analysis_conclusions WHERE source='运营智慧' AND source_ref=?", (f"wisdom:{int(wisdom_id)}",))
+    clear_analysis_cache()
 
 
 def add_holiday_rule(data):
@@ -1487,11 +1604,13 @@ def sync_wisdom_analysis(wisdom_id):
         row = conn.execute("SELECT * FROM wisdom WHERE id=?", (int(wisdom_id),)).fetchone()
         conn.execute("DELETE FROM analysis_conclusions WHERE source='运营智慧' AND source_ref=?", (source_ref,))
         if not row:
+            clear_analysis_cache()
             return
         text = f"{row['title']}。{row['content']}"
         months = parse_months_from_text(text)
         categories = category_rows_from_text(text, row["category_key"])
         if not months or not categories:
+            clear_analysis_cache()
             return
         for category in categories:
             category_key = category.get("level3_zh") or row["category_key"]
@@ -1525,6 +1644,7 @@ def sync_wisdom_analysis(wisdom_id):
                     source_ref,
                 ),
             )
+    clear_analysis_cache()
 
 
 def sync_all_wisdom_analysis():
@@ -1789,23 +1909,38 @@ def excluded_by_terms(item, excludes):
     return any(term and term in text for term in excludes)
 
 
-def fuzzy_search_all(message):
+def make_chat_context(message):
     terms = search_terms(message)
     detected_country = get_context_country(message)
     category_scope = detect_category_scope(message)
-    enumerate_all = is_enumeration_query(message)
-    country_overview = is_country_overview_query(message, detected_country, category_scope)
-    excludes = excluded_category_terms(message)
-    context = {"query": message, "terms": terms, "country": detected_country, "category_scope": category_scope, "enumerate": enumerate_all, "analysis": [], "merchants": [], "wisdom": [], "raw_rows": [], "raw_files": [], "holidays": []}
-    if not terms:
-        return context
+    context = {
+        "query": message,
+        "terms": terms,
+        "country": detected_country,
+        "category_scope": category_scope,
+        "enumerate": is_enumeration_query(message),
+        "country_overview": is_country_overview_query(message, detected_country, category_scope),
+        "excludes": excluded_category_terms(message),
+        "analysis": [],
+        "merchants": [],
+        "wisdom": [],
+        "raw_rows": [],
+        "raw_files": [],
+        "holidays": [],
+    }
+    return context
+
+
+def search_analysis_source(context):
+    if not context["terms"]:
+        return []
+    hits = []
     with get_conn() as conn:
-        analysis_hits = []
         for row in conn.execute("SELECT * FROM analysis_conclusions ORDER BY avg_sales DESC"):
             item = decode_row(row)
-            if detected_country and item["country"] not in (detected_country, "", "全部国家"):
+            if context["country"] and item["country"] not in (context["country"], "", "全部国家"):
                 continue
-            if not in_category_scope(item, category_scope) or excluded_by_terms(item, excludes):
+            if not in_category_scope(item, context["category_scope"]) or excluded_by_terms(item, context["excludes"]):
                 continue
             text = " ".join([
                 item["country"], str(item["year"]), item.get("time_range_label", ""), item["category_key"], item.get("category_name_zh", ""),
@@ -1813,83 +1948,69 @@ def fuzzy_search_all(message):
                 item.get("category_l1_zh", ""), item.get("category_l2_zh", ""), item.get("category_l3_zh", ""),
                 item["peak_months"].__repr__(),
             ])
-            score = score_terms(text, terms)
-            if score >= 2 or (enumerate_all and category_scope) or country_overview:
-                analysis_hits.append((score, item))
-        context["analysis"] = [item for _, item in sorted(analysis_hits, key=lambda pair: pair[0], reverse=True)[:60 if enumerate_all else 12]]
+            score = score_terms(text, context["terms"])
+            if score >= 2 or (context["enumerate"] and context["category_scope"]) or context["country_overview"]:
+                hits.append((score, item))
+    limit = 60 if context["enumerate"] else 12
+    return [item for _, item in sorted(hits, key=lambda pair: pair[0], reverse=True)[:limit]]
 
-        merchant_hits = []
+
+def search_merchant_source(context):
+    if not context["terms"]:
+        return []
+    hits = []
+    with get_conn() as conn:
         for row in conn.execute("SELECT * FROM merchant_resources ORDER BY sales DESC"):
             item = dict(row)
-            if detected_country and item["country"] not in (detected_country, "", "全部国家"):
+            if context["country"] and item["country"] not in (context["country"], "", "全部国家"):
                 continue
-            if not in_category_scope(item, category_scope) or excluded_by_terms(item, excludes):
+            if not in_category_scope(item, context["category_scope"]) or excluded_by_terms(item, context["excludes"]):
                 continue
             item["category_name_zh"] = category_zh(item["category_key"])
             text = " ".join(str(item.get(key, "")) for key in [
                 "country", "seller_name", "company_name", "contact", "address", "email",
                 "seller_location", "seller_info", "category_key", "category_name_zh", "category_l1_zh", "category_l2_zh", "category_l3_zh", "notes",
             ])
-            score = score_terms(text, terms)
-            if score >= 2 or (enumerate_all and category_scope):
-                merchant_hits.append((score, item))
-        context["merchants"] = [item for _, item in sorted(merchant_hits, key=lambda pair: pair[0], reverse=True)[:15]]
+            score = score_terms(text, context["terms"])
+            if score >= 2 or (context["enumerate"] and context["category_scope"]):
+                hits.append((score, item))
+    return [item for _, item in sorted(hits, key=lambda pair: pair[0], reverse=True)[:15]]
 
-        wisdom_hits = []
+
+def search_wisdom_source(context):
+    if not context["terms"]:
+        return []
+    hits = []
+    with get_conn() as conn:
         for row in conn.execute("SELECT * FROM wisdom ORDER BY id DESC"):
             item = dict(row)
-            if detected_country and item.get("country") and item["country"] not in (detected_country, "", "全部国家"):
+            if context["country"] and item.get("country") and item["country"] not in (context["country"], "", "全部国家"):
                 continue
             item["category_name_zh"] = category_zh(item["category_key"])
-            if category_scope and item.get("category_key") and item.get("category_key") != category_scope["value"]:
+            if context["category_scope"] and item.get("category_key") and item.get("category_key") != context["category_scope"]["value"]:
                 matched = match_category_key(item.get("category_key"))
                 item.update({"category_l1_zh": matched["l1"], "category_l2_zh": matched["l2"], "category_l3_zh": matched["l3"]})
-            if not in_category_scope(item, category_scope):
+            if not in_category_scope(item, context["category_scope"]):
                 continue
             text = " ".join(str(item.get(key, "")) for key in ["country", "category_key", "category_name_zh", "title", "content", "keywords"])
-            score = score_terms(text, terms)
+            score = score_terms(text, context["terms"])
             if score >= 2:
-                wisdom_hits.append((score, item))
-        context["wisdom"] = [item for _, item in sorted(wisdom_hits, key=lambda pair: pair[0], reverse=True)[:10]]
+                hits.append((score, item))
+    return [item for _, item in sorted(hits, key=lambda pair: pair[0], reverse=True)[:10]]
 
-        raw_hits = []
-        for row in conn.execute("SELECT * FROM sales_rows ORDER BY sales DESC"):
-            item = dict(row)
-            if detected_country and item["country"] != detected_country:
-                continue
-            if not in_category_scope(item, category_scope) or excluded_by_terms(item, excludes):
-                continue
-            text = " ".join(str(item.get(key, "")) for key in [
-                "country", "year", "month", "title", "brand", "category_path", "major_category",
-                "minor_category", "category_l1_zh", "category_l2_zh", "category_l3_zh", "seller", "seller_location", "seller_info",
-            ])
-            score = score_terms(text, terms)
-            if score >= 2 or (enumerate_all and category_scope):
-                item["category_name_zh"] = item.get("category_l3_zh") or category_zh(item["minor_category"])
-                raw_hits.append((score, item))
-        context["raw_rows"] = [item for _, item in sorted(raw_hits, key=lambda pair: pair[0], reverse=True)[:60 if enumerate_all else 15]]
 
-        raw_file_hits = []
-        for row in conn.execute("SELECT * FROM raw_files ORDER BY imported_at DESC"):
-            item = dict(row)
-            if detected_country and item["country"] != detected_country:
-                continue
-            text = " ".join(str(item.get(key, "")) for key in ["country", "year", "month", "file_name", "notes"])
-            score = score_terms(text, terms)
-            if score >= 2:
-                raw_file_hits.append((score, item))
-        context["raw_files"] = [item for _, item in sorted(raw_file_hits, key=lambda pair: pair[0], reverse=True)[:10]]
-
-        holiday_hits = []
-        for row in conn.execute("SELECT * FROM holidays ORDER BY start_date"):
-            item = dict(row)
-            if detected_country and item["country"] != detected_country:
-                continue
-            text = " ".join(str(item.get(key, "")) for key in ["country", "year", "start_date", "name_cn", "name_local", "kind", "consumer_note"])
-            score = score_terms(text, terms)
-            if score >= 2:
-                holiday_hits.append((score, item))
-        context["holidays"] = [item for _, item in sorted(holiday_hits, key=lambda pair: pair[0], reverse=True)[:10]]
+def fuzzy_search_all(message):
+    context = make_chat_context(message)
+    if not context["terms"]:
+        return context
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            "analysis": pool.submit(search_analysis_source, context),
+            "wisdom": pool.submit(search_wisdom_source, context),
+            "merchants": pool.submit(search_merchant_source, context),
+        }
+        for key, future in futures.items():
+            context[key] = future.result()
     return context
 
 
@@ -1915,29 +2036,35 @@ def read_deepseek_config():
 
 
 def build_context_prompt(message, context):
-    lines = ["【本地数据库查到的信息】"]
-    for merchant in context["merchants"]:
-        lines.append(f"- 店铺：{merchant['seller_name']}，公司：{merchant.get('company_name') or '待补充'}，电话：{merchant.get('contact') or '待补充'}，邮箱：{merchant.get('email') or '待补充'}，地址：{merchant.get('address') or merchant.get('seller_location') or '待补充'}，主营类目：{category_zh(merchant.get('category_key'))}")
+    lines = ["【分析结论库检索结果】"]
     for item in context["analysis"]:
         peaks = "、".join(format_peak_month(p, item.get("time_range_start", "")) for p in item["peak_months"])
         symbol = currency_symbol(item["country"])
-        lines.append(f"- 类目：{item['category_name_zh']}（原始：{item['category_key']}），时间范围：{item.get('time_range_label', '')}，该类目销售高峰：{peaks}，价格带：{symbol}{item['price_low']:.2f}-{symbol}{item['price_high']:.2f}，更新时间：{item['created_at']}")
+        lines.append(f"- 国家：{item['country'] or '全部国家'}，类目：{item['category_name_zh']}（{item.get('category_l1_zh', '')}/{item.get('category_l2_zh', '')}/{item.get('category_l3_zh') or item['category_key']}），时间范围：{item.get('time_range_label', '')}，高峰月：{peaks}，价格带：{symbol}{item['price_low']:.2f}-{symbol}{item['price_high']:.2f}，数据口径：{item.get('completeness_note') or '未标注'}")
+    if not context["analysis"]:
+        lines.append("（无相关记录）")
+
+    lines.append("")
+    lines.append("【运营智慧库检索结果】")
     for item in context["wisdom"]:
-        lines.append(f"- 运营智慧：{item['title']}：{item['content']}")
-    for item in context.get("raw_rows", [])[:8]:
-        symbol = currency_symbol(item["country"])
-        lines.append(f"- 原始数据：{item['country']} {item['year']}年{item['month']}月，商品：{item.get('title') or '未命名'}，类目：{item.get('category_l3_zh') or category_zh(item.get('minor_category'))}，商家：{item.get('seller') or '未知'}，销售额：{symbol}{item.get('sales') or 0:.2f}，销量：{item.get('units') or 0}")
-    for item in context.get("raw_files", []):
-        lines.append(f"- 原始文件：{item['country']} {item['year']}年{item['month']}月，文件名：{item['file_name']}，导入行数：{item['imported_rows']}")
-    for item in context.get("holidays", []):
-        lines.append(f"- 日历节庆：{item['country']} {item['start_date']} {item['name_cn']} / {item['name_local']}：{item['consumer_note']}")
-    if len(lines) == 1:
-        lines.append("- 本地数据库中暂无匹配信息。")
+        country = item.get("country") or "全部国家"
+        category = item.get("category_name_zh") or item.get("category_key") or "无类目"
+        lines.append(f"- 国家：{country}，类目：{category}，标题：{item['title']}，内容：{item['content']}")
+    if not context["wisdom"]:
+        lines.append("（无相关记录）")
+
+    lines.append("")
+    lines.append("【商家资源库检索结果】")
+    for merchant in context["merchants"]:
+        lines.append(f"- 店铺：{merchant['seller_name']}，公司：{merchant.get('company_name') or '待补充'}，电话：{merchant.get('contact') or '待补充'}，邮箱：{merchant.get('email') or '待补充'}，地址：{merchant.get('address') or merchant.get('seller_location') or '待补充'}，主营类目：{category_zh(merchant.get('category_key'))}，销售额参考：{merchant.get('sales') or 0:.2f}")
+    if not context["merchants"]:
+        lines.append("（无相关记录）")
+
     lines.append("")
     lines.append("【用户的问题】")
     lines.append(message)
     lines.append("")
-    lines.append("请基于以上【本地数据库查到的信息】回答用户的问题。如果信息不足以完整回答，请主动说明缺失内容并追问用户。严禁自行编造具体销售额数字、具体高峰月份、具体价格带和商家联系方式。")
+    lines.append("请基于以上所有本地检索结果，综合回答用户的问题。回答要自然、有逻辑层次，尽量覆盖：核心结论、原因解释、商家资源、数据依据。没有相关记录的数据源不要在答案里生硬提及。严禁自行编造具体销售额数字、具体高峰月份、具体价格带和商家联系方式。")
     return "\n".join(lines)
 
 
@@ -1968,18 +2095,7 @@ def ask_deepseek(message, context):
 
 
 def context_has_results(context):
-    return any(context.get(key) for key in ("analysis", "merchants", "wisdom", "raw_rows", "raw_files", "holidays"))
-
-
-def priority_context(context):
-    result = dict(context)
-    if context.get("analysis"):
-        result.update({"wisdom": [], "merchants": [], "raw_rows": [], "raw_files": [], "holidays": []})
-    elif context.get("wisdom"):
-        result.update({"merchants": [], "raw_rows": [], "raw_files": [], "holidays": []})
-    elif context.get("merchants"):
-        result.update({"raw_rows": [], "raw_files": [], "holidays": []})
-    return result
+    return any(context.get(key) for key in ("analysis", "merchants", "wisdom"))
 
 
 def local_answer(context, message):
@@ -2160,11 +2276,10 @@ def local_chat_answer(message):
             conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('user', ?, ?)", (message, now_text()))
             conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('assistant', ?, ?)", (answer, now_text()))
         return {"answer": answer, "context": context}
-    context = priority_context(context)
     CHAT_CONTEXT["suggestions"] = {}
     CHAT_CONTEXT["guidance_rounds"] = 0
     CHAT_CONTEXT["last_context"] = context
-    answer = local_answer(context, resolved_message)
+    answer = ask_deepseek(resolved_message, context) or local_answer(context, resolved_message)
     answer = f"{answer}\n\n{source_note(context)}"
     with get_conn() as conn:
         conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('user', ?, ?)", (message, now_text()))

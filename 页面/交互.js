@@ -23,6 +23,8 @@ const filters = {
   wisdomCountry: "",
   wisdomCategory: "",
 };
+let timeRangeDebounceTimer = null;
+const analysisRangeCache = new Map();
 
 const fmt = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 });
 const zhPinyinCollator = new Intl.Collator("zh-Hans-CN-u-co-pinyin", { numeric: true, sensitivity: "base" });
@@ -134,6 +136,38 @@ function timeRangeMatches(row) {
   return bounds.start <= selected.end && bounds.end >= selected.start;
 }
 
+function activeAnalysisRows() {
+  return state?.analysisRangeRows || state?.analysis || [];
+}
+
+function analysisRangeCacheKey() {
+  const bounds = selectedTimeBounds();
+  return bounds ? `${monthFromIndex(bounds.start)}|${monthFromIndex(bounds.end)}` : "";
+}
+
+async function loadAnalysisForSelectedRange() {
+  const bounds = selectedTimeBounds();
+  const key = analysisRangeCacheKey();
+  if (!bounds || !key) return;
+  if (analysisRangeCache.has(key)) {
+    state.analysisRangeRows = analysisRangeCache.get(key);
+  } else {
+    const result = await api(`/api/analysis?start=${monthFromIndex(bounds.start)}&end=${monthFromIndex(bounds.end)}`);
+    state.analysisRangeRows = result.analysis || [];
+    analysisRangeCache.set(key, state.analysisRangeRows);
+  }
+  renderAnalysis();
+  renderKnowledgeFilters("analysis");
+  renderAnalysisTable();
+}
+
+function scheduleAnalysisRangeLoad() {
+  clearTimeout(timeRangeDebounceTimer);
+  timeRangeDebounceTimer = setTimeout(() => {
+    loadAnalysisForSelectedRange().catch(err => notify(`时间范围加载失败：${err.message}`));
+  }, 300);
+}
+
 function rangePercent(value, extent) {
   if (!extent || extent.max === extent.min) return 0;
   return (value - extent.min) / (extent.max - extent.min) * 100;
@@ -198,8 +232,7 @@ function handleTimeRangeInput(input) {
     filters.timeRangeEnd = Math.max(value, filters.timeRangeStart);
   }
   updateTimeRangeControls();
-  renderAnalysis();
-  renderAnalysisTable();
+  scheduleAnalysisRangeLoad();
 }
 
 function analysisCategoryPath(item) {
@@ -300,6 +333,8 @@ async function loadState() {
   const y = viewDate.getFullYear();
   const m = viewDate.getMonth() + 1;
   state = await api(`/api/state?year=${y}&month=${m}`);
+  state.analysisRangeRows = null;
+  analysisRangeCache.clear();
   renderAll();
 }
 
@@ -324,7 +359,7 @@ function renderAll() {
 }
 
 function filteredAnalysisForHome() {
-  return state.analysis.filter(item => !filters.rootCategory || item.category_root === filters.rootCategory || item.category_l1_zh === filters.rootCategory);
+  return activeAnalysisRows().filter(item => !filters.rootCategory || item.category_root === filters.rootCategory || item.category_l1_zh === filters.rootCategory);
 }
 
 function analysisForPanel() {
@@ -503,14 +538,14 @@ function renderKnowledgeFilters(kind) {
 }
 
 function getRowsForKind(kind) {
-  if (kind === "analysis") return state.analysis;
+  if (kind === "analysis") return activeAnalysisRows();
   if (kind === "merchant") return state.merchants;
   return [];
 }
 
 function getCategoriesForKind(kind) {
   let rows = [];
-  if (kind === "analysis") rows = state.analysis;
+  if (kind === "analysis") rows = activeAnalysisRows();
   if (kind === "merchant") rows = state.merchants;
   if (kind === "wisdom") {
     return sortCategoryOptions((state.category_roots || []).map(name => ({ key: name, name })));
@@ -602,7 +637,7 @@ function filterRows(rows, kind) {
 }
 
 function renderAnalysisTable() {
-  const rows = filterRows(state.analysis, "analysis");
+  const rows = filterRows(activeAnalysisRows(), "analysis");
   document.getElementById("analysisTable").innerHTML = `
     <div class="table">
       ${rows.map(item => {
