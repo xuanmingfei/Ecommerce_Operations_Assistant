@@ -193,10 +193,6 @@ h2 { font-size: 18px; letter-spacing: 0; }
 .time-range-control {
   min-width: 280px;
 }
-.filter-range-wrap {
-  flex: 1 1 360px;
-  min-width: 320px;
-}
 .range-title {
   display: flex;
   justify-content: space-between;

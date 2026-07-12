@@ -12,6 +12,7 @@ const filters = {
   rawCategory: "",
   rawYear: "",
   analysisCountry: "",
+  analysisTimeRange: "",
   analysisL1: "",
   analysisL2: "",
   analysisL3: "",
@@ -53,6 +54,10 @@ function rowTimeRange(row) {
   if (row.time_range_start && row.time_range_end) return `${row.time_range_start} 至 ${row.time_range_end}`;
   if (row.year) return `${row.year}-01 至 ${row.year}-12`;
   return "未标注时间范围";
+}
+
+function timeRangeOptions(rows) {
+  return Array.from(new Set((rows || []).map(rowTimeRange).filter(Boolean))).sort((a, b) => b.localeCompare(a));
 }
 
 function normalizeMonthKey(value) {
@@ -128,15 +133,7 @@ function selectedTimeRangeLabel() {
   return bounds ? timeRangeLabel(bounds.start, bounds.end) : "暂无时间范围";
 }
 
-function timeRangeMatches(row) {
-  const selected = selectedTimeBounds();
-  if (!selected) return true;
-  const bounds = rowTimeBounds(row);
-  if (!bounds) return false;
-  return bounds.start <= selected.end && bounds.end >= selected.start;
-}
-
-function activeAnalysisRows() {
+function activeHomeAnalysisRows() {
   return state?.analysisRangeRows || state?.analysis || [];
 }
 
@@ -156,9 +153,8 @@ async function loadAnalysisForSelectedRange() {
     state.analysisRangeRows = result.analysis || [];
     analysisRangeCache.set(key, state.analysisRangeRows);
   }
+  document.getElementById("analysisCount").textContent = filteredAnalysisForHome().length;
   renderAnalysis();
-  renderKnowledgeFilters("analysis");
-  renderAnalysisTable();
 }
 
 function scheduleAnalysisRangeLoad() {
@@ -173,14 +169,14 @@ function rangePercent(value, extent) {
   return (value - extent.min) / (extent.max - extent.min) * 100;
 }
 
-function timeRangeSliderHtml(scope) {
+function timeRangeSliderHtml() {
   const bounds = selectedTimeBounds();
   if (!bounds) return `<p class="small">暂无可筛选时间范围。</p>`;
   const left = rangePercent(bounds.start, bounds);
   const right = rangePercent(bounds.end, bounds);
   const months = selectedMonthCount();
   return `
-    <div class="time-range-control" data-range-scope="${scope}">
+    <div class="time-range-control">
       <div class="range-title">
         <span>时间范围</span>
         <strong data-range-label>${escapeHtml(selectedTimeRangeLabel())}</strong>
@@ -359,7 +355,7 @@ function renderAll() {
 }
 
 function filteredAnalysisForHome() {
-  return activeAnalysisRows().filter(item => !filters.rootCategory || item.category_root === filters.rootCategory || item.category_l1_zh === filters.rootCategory);
+  return activeHomeAnalysisRows().filter(item => !filters.rootCategory || item.category_root === filters.rootCategory || item.category_l1_zh === filters.rootCategory);
 }
 
 function analysisForPanel() {
@@ -391,8 +387,7 @@ function renderHomeCountryFilter() {
 }
 
 function renderTimeRangeFilter() {
-  const container = document.getElementById("timeRangeFilter");
-  container.innerHTML = timeRangeSliderHtml("home");
+  document.getElementById("timeRangeFilter").innerHTML = timeRangeSliderHtml();
 }
 
 function renderCalendar() {
@@ -420,7 +415,7 @@ function renderReminders() {
 
 function renderAnalysis() {
   const list = document.getElementById("analysisList");
-  const items = analysisForPanel().filter(timeRangeMatches).slice(0, 36);
+  const items = analysisForPanel().slice(0, 36);
   list.innerHTML = items.map(renderAnalysisCard).join("") || `<p class="small">暂无分析结论。</p>`;
 }
 
@@ -519,33 +514,39 @@ function renderKnowledgeFilters(kind) {
   const categoryKey = `${kind}Category`;
   const categories = getCategoriesForKind(kind);
   const categoryLabel = kind === "wisdom" ? "全部一级类目" : "全部三级类目";
-  const timeRangeFilter = kind === "analysis" ? `<div class="filter-range-wrap">${timeRangeSliderHtml("analysis")}</div>` : "";
+  const timeRangeSelect = kind === "analysis" ? `
+    <select data-filter="analysisTimeRange">
+      <option value="">全部时间范围</option>
+      ${timeRangeOptions(state.analysis).map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}
+    </select>` : "";
   container.innerHTML = `
     <select data-filter="${countryKey}">
       <option value="">全部国家</option>
       ${sortCountries(state.countries).map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
     </select>
-    ${timeRangeFilter}
+    ${timeRangeSelect}
     <select data-filter="${categoryKey}">
       <option value="">${categoryLabel}</option>
       ${categories.map(c => `<option value="${escapeHtml(c.key)}">${escapeHtml(c.name)}｜${escapeHtml(c.key)}</option>`).join("")}
     </select>
     ${kind === "merchant" ? `<input data-filter="merchantKeyword" placeholder="搜索店铺/公司名称">` : ""}`;
   container.querySelector(`[data-filter="${countryKey}"]`).value = filters[countryKey] || "";
+  const timeRange = container.querySelector('[data-filter="analysisTimeRange"]');
+  if (timeRange) timeRange.value = filters.analysisTimeRange || "";
   container.querySelector(`[data-filter="${categoryKey}"]`).value = filters[categoryKey] || "";
   const keyword = container.querySelector('[data-filter="merchantKeyword"]');
   if (keyword) keyword.value = filters.merchantKeyword || "";
 }
 
 function getRowsForKind(kind) {
-  if (kind === "analysis") return activeAnalysisRows();
+  if (kind === "analysis") return state.analysis;
   if (kind === "merchant") return state.merchants;
   return [];
 }
 
 function getCategoriesForKind(kind) {
   let rows = [];
-  if (kind === "analysis") rows = activeAnalysisRows();
+  if (kind === "analysis") rows = state.analysis;
   if (kind === "merchant") rows = state.merchants;
   if (kind === "wisdom") {
     return sortCategoryOptions((state.category_roots || []).map(name => ({ key: name, name })));
@@ -625,11 +626,12 @@ function matchesCategoryCascade(row, kind) {
 function filterRows(rows, kind) {
   const country = filters[`${kind}Country`];
   const category = filters[`${kind}Category`];
+  const timeRange = kind === "analysis" ? filters.analysisTimeRange : "";
   const keyword = String(filters.merchantKeyword || "").trim().toLowerCase();
   return rows.filter(row => {
     const baseOk = (!country || row.country === country) &&
       (!category || row.category_key === category) &&
-      (kind !== "analysis" || timeRangeMatches(row));
+      (!timeRange || rowTimeRange(row) === timeRange);
     if (!baseOk) return false;
     if (kind !== "merchant" || !keyword) return true;
     return String(row.seller_name || "").toLowerCase().includes(keyword) || String(row.company_name || "").toLowerCase().includes(keyword);
@@ -637,7 +639,7 @@ function filterRows(rows, kind) {
 }
 
 function renderAnalysisTable() {
-  const rows = filterRows(activeAnalysisRows(), "analysis");
+  const rows = filterRows(state.analysis, "analysis");
   document.getElementById("analysisTable").innerHTML = `
     <div class="table">
       ${rows.map(item => {
