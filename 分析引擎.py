@@ -1065,6 +1065,14 @@ def format_peak_month(item, fallback_start=""):
     return f"{year}年{month}月" if year else f"{month}月"
 
 
+def format_month_key_text(value):
+    text = normalize_month(value)
+    if not text:
+        return str(value or "")
+    year, month = text.split("-")
+    return f"{int(year)}年{int(month)}月"
+
+
 def build_completeness_note(conn, country, start_month, end_month, sample_months):
     expected = iter_months(start_month, end_month)
     category_months = sorted({m.get("key") or month_key(m.get("year", start_month[:4]), m["month"]) for m in sample_months})
@@ -1085,13 +1093,13 @@ def build_completeness_note(conn, country, start_month, end_month, sample_months
         notes.append("数据量较少，分析结果可能不具代表性，建议扩大时间范围")
     if category_months:
         if len(category_months) < len(expected):
-            notes.append(f"目前该类目仅有 {'、'.join(category_months)} 数据，其他月份暂无该类目数据；高峰判断只基于已上传月份")
+            notes.append(f"目前该类目仅有 {'、'.join(format_month_key_text(m) for m in category_months)}数据，其他月份暂无该类目数据；高峰判断只基于已上传月份")
         else:
-            notes.append(f"该类目已有 {start_month} 至 {end_month} 数据")
+            notes.append(f"该类目已有 {format_month_key_text(start_month)} 至 {format_month_key_text(end_month)} 数据")
     if missing:
-        notes.append(f"{country} 在所选区间尚缺 {'、'.join(missing)} 月文件")
+        notes.append(f"{country} 在所选区间尚缺 {'、'.join(format_month_key_text(m) for m in missing)}文件")
     if small:
-        notes.append(f"{'、'.join(small)} 数据源样本数偏少")
+        notes.append(f"{'、'.join(format_month_key_text(m) for m in small)}数据源样本数偏少")
     return "；".join(notes) or "样本月份相对完整"
 
 

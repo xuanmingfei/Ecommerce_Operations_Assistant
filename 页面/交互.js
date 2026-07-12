@@ -3,7 +3,8 @@ let viewDate = new Date();
 const filters = {
   rootCategory: "",
   homeCountry: "",
-  homeTimeRange: "",
+  timeRangeStart: null,
+  timeRangeEnd: null,
   homeL1: "",
   homeL2: "",
   homeL3: "",
@@ -11,7 +12,6 @@ const filters = {
   rawCategory: "",
   rawYear: "",
   analysisCountry: "",
-  analysisTimeRange: "",
   analysisL1: "",
   analysisL2: "",
   analysisL3: "",
@@ -53,14 +53,207 @@ function rowTimeRange(row) {
   return "未标注时间范围";
 }
 
-function timeRangeOptions(rows) {
-  return Array.from(new Set((rows || []).map(rowTimeRange).filter(Boolean))).sort((a, b) => b.localeCompare(a));
+function normalizeMonthKey(value) {
+  const match = String(value || "").match(/(\d{4})-(\d{1,2})/);
+  if (!match) return "";
+  return `${match[1]}-${String(Number(match[2])).padStart(2, "0")}`;
+}
+
+function monthIndex(value) {
+  const key = normalizeMonthKey(value);
+  if (!key) return null;
+  const [year, month] = key.split("-").map(Number);
+  return year * 12 + month - 1;
+}
+
+function monthFromIndex(value) {
+  const year = Math.floor(value / 12);
+  const month = value % 12 + 1;
+  return `${year}-${String(month).padStart(2, "0")}`;
+}
+
+function rowTimeBounds(row) {
+  if (!row.time_range_start || !row.time_range_end) return null;
+  const start = monthIndex(row.time_range_start);
+  const end = monthIndex(row.time_range_end);
+  if (start === null || end === null) return null;
+  return { start: Math.min(start, end), end: Math.max(start, end) };
+}
+
+function allTimeExtent() {
+  const bounds = (state?.analysis || []).map(rowTimeBounds).filter(Boolean);
+  if (!bounds.length) return null;
+  return {
+    min: Math.min(...bounds.map(item => item.start)),
+    max: Math.max(...bounds.map(item => item.end)),
+  };
+}
+
+function ensureTimeRangeSelection() {
+  const extent = allTimeExtent();
+  if (!extent) return null;
+  if (filters.timeRangeStart === null || filters.timeRangeEnd === null) {
+    filters.timeRangeStart = extent.min;
+    filters.timeRangeEnd = extent.max;
+  }
+  filters.timeRangeStart = Math.max(extent.min, Math.min(filters.timeRangeStart, extent.max));
+  filters.timeRangeEnd = Math.max(extent.min, Math.min(filters.timeRangeEnd, extent.max));
+  if (filters.timeRangeStart > filters.timeRangeEnd) {
+    filters.timeRangeStart = filters.timeRangeEnd;
+  }
+  return extent;
+}
+
+function selectedTimeBounds() {
+  const extent = ensureTimeRangeSelection();
+  if (!extent) return null;
+  return { start: filters.timeRangeStart, end: filters.timeRangeEnd, ...extent };
+}
+
+function selectedMonthCount() {
+  const bounds = selectedTimeBounds();
+  return bounds ? bounds.end - bounds.start + 1 : 0;
+}
+
+function timeRangeLabel(start, end) {
+  const startText = monthFromIndex(start);
+  const endText = monthFromIndex(end);
+  return startText === endText ? startText : `${startText} 至 ${endText}`;
+}
+
+function selectedTimeRangeLabel() {
+  const bounds = selectedTimeBounds();
+  return bounds ? timeRangeLabel(bounds.start, bounds.end) : "暂无时间范围";
+}
+
+function timeRangeMatches(row) {
+  const selected = selectedTimeBounds();
+  if (!selected) return true;
+  const bounds = rowTimeBounds(row);
+  if (!bounds) return false;
+  return bounds.start <= selected.end && bounds.end >= selected.start;
+}
+
+function rangePercent(value, extent) {
+  if (!extent || extent.max === extent.min) return 0;
+  return (value - extent.min) / (extent.max - extent.min) * 100;
+}
+
+function timeRangeSliderHtml(scope) {
+  const bounds = selectedTimeBounds();
+  if (!bounds) return `<p class="small">暂无可筛选时间范围。</p>`;
+  const left = rangePercent(bounds.start, bounds);
+  const right = rangePercent(bounds.end, bounds);
+  const months = selectedMonthCount();
+  return `
+    <div class="time-range-control" data-range-scope="${scope}">
+      <div class="range-title">
+        <span>时间范围</span>
+        <strong data-range-label>${escapeHtml(selectedTimeRangeLabel())}</strong>
+      </div>
+      <div class="range-slider">
+        <div class="range-track"></div>
+        <div class="range-fill" data-range-fill style="left:${left}%; right:${100 - right}%"></div>
+        <input type="range" min="${bounds.min}" max="${bounds.max}" value="${bounds.start}" data-range-handle="start" aria-label="开始月份">
+        <input type="range" min="${bounds.min}" max="${bounds.max}" value="${bounds.end}" data-range-handle="end" aria-label="结束月份">
+      </div>
+      <p class="range-warning${months < 3 ? " show" : ""}" data-range-warning>数据量较少（仅${months}个月），分析结果可能不具代表性，建议扩大时间范围</p>
+    </div>`;
+}
+
+function updateTimeRangeControls() {
+  const bounds = selectedTimeBounds();
+  if (!bounds) return;
+  const left = rangePercent(bounds.start, bounds);
+  const right = rangePercent(bounds.end, bounds);
+  const months = selectedMonthCount();
+  document.querySelectorAll(".time-range-control").forEach(control => {
+    control.querySelectorAll("input[type='range']").forEach(input => {
+      input.min = bounds.min;
+      input.max = bounds.max;
+      input.value = input.dataset.rangeHandle === "start" ? bounds.start : bounds.end;
+    });
+    const fill = control.querySelector("[data-range-fill]");
+    if (fill) {
+      fill.style.left = `${left}%`;
+      fill.style.right = `${100 - right}%`;
+    }
+    const label = control.querySelector("[data-range-label]");
+    if (label) label.textContent = selectedTimeRangeLabel();
+    const warning = control.querySelector("[data-range-warning]");
+    if (warning) {
+      warning.textContent = `数据量较少（仅${months}个月），分析结果可能不具代表性，建议扩大时间范围`;
+      warning.classList.toggle("show", months < 3);
+    }
+  });
+}
+
+function handleTimeRangeInput(input) {
+  const bounds = selectedTimeBounds();
+  if (!bounds) return;
+  const value = Number(input.value);
+  if (input.dataset.rangeHandle === "start") {
+    filters.timeRangeStart = Math.min(value, filters.timeRangeEnd);
+  } else {
+    filters.timeRangeEnd = Math.max(value, filters.timeRangeStart);
+  }
+  updateTimeRangeControls();
+  renderAnalysis();
+  renderAnalysisTable();
+}
+
+function analysisCategoryPath(item) {
+  const parts = [
+    item.category_l1_zh,
+    item.category_l2_zh,
+    item.category_l3_zh || item.category_name_zh || item.category_key,
+  ].filter(Boolean);
+  return parts.length ? parts.join(" / ") : (item.category_key || "未识别类目");
 }
 
 function monthText(item) {
   if (item.key) return item.key;
   if (item.year && item.month) return `${item.year}-${String(item.month).padStart(2, "0")}`;
   return `${item.month}月`;
+}
+
+function monthLabel(year, month) {
+  return `${Number(year)}年${Number(month)}月`;
+}
+
+function monthLabelFromKey(value) {
+  const match = String(value || "").match(/(\d{4})-(\d{1,2})/);
+  return match ? monthLabel(match[1], match[2]) : String(value || "");
+}
+
+function sampleMonthLabels(item) {
+  return (item.sample_months || [])
+    .map(month => month.key || (month.year && month.month ? `${month.year}-${String(month.month).padStart(2, "0")}` : ""))
+    .filter(Boolean)
+    .sort()
+    .map(monthLabelFromKey);
+}
+
+function expandMonthList(year, text) {
+  return String(text || "")
+    .split(/[、,，\s]+/)
+    .map(value => value.trim())
+    .filter(Boolean)
+    .map(month => monthLabel(year, month))
+    .join("、");
+}
+
+function formatCompletenessNote(item) {
+  let note = item.completeness_note || "阶段性结论";
+  const sampleLabels = sampleMonthLabels(item);
+  if (sampleLabels.length) {
+    note = note.replace(/目前该类目仅有\s+.*?数据/, `目前该类目仅有 ${sampleLabels.join("、")}数据`);
+  }
+  note = note.replace(/(\d{4})-(\d{1,2})/g, (_, year, month) => monthLabel(year, month));
+  note = note.replace(/(\d{4})\s*年该国家数据源尚缺\s+([0-9,，、\s]+)\s*月文件/g, (_, year, months) => `${year}年该国家数据源尚缺 ${expandMonthList(year, months)}文件`);
+  note = note.replace(/(\d{4})\s*年该国家数据源尚缺\s+([0-9,，、\s]+)\s*月/g, (_, year, months) => `${year}年该国家数据源尚缺 ${expandMonthList(year, months)}`);
+  note = note.replace(/(\d{4})\s*年(\d{1,2})\s*月/g, (_, year, month) => monthLabel(year, month));
+  return note;
 }
 
 function peakText(peaks) {
@@ -163,12 +356,8 @@ function renderHomeCountryFilter() {
 }
 
 function renderTimeRangeFilter() {
-  const select = document.getElementById("timeRangeFilter");
-  const current = filters.homeTimeRange || select.value;
-  const ranges = timeRangeOptions(analysisForPanel());
-  select.innerHTML = `<option value="">全部时间范围</option>` + ranges.map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
-  select.value = current;
-  filters.homeTimeRange = select.value;
+  const container = document.getElementById("timeRangeFilter");
+  container.innerHTML = timeRangeSliderHtml("home");
 }
 
 function renderCalendar() {
@@ -195,19 +384,22 @@ function renderReminders() {
 }
 
 function renderAnalysis() {
-  const timeRange = filters.homeTimeRange;
   const list = document.getElementById("analysisList");
-  const items = analysisForPanel().filter(item => !timeRange || rowTimeRange(item) === timeRange).slice(0, 36);
+  const items = analysisForPanel().filter(timeRangeMatches).slice(0, 36);
   list.innerHTML = items.map(renderAnalysisCard).join("") || `<p class="small">暂无分析结论。</p>`;
 }
 
 function renderAnalysisCard(item) {
   const symbol = currencySymbol(item.country);
   const maxSales = Math.max(...item.chart_data.map(m => m.sales), 1);
+  const averageLine = Math.max(0, Math.min(100, (item.avg_sales || 0) / maxSales * 100));
   const bars = item.chart_data.map(m => `
     <div class="bar">
       <span>${monthText(m)}</span>
-      <div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, m.sales / maxSales * 100)}%"></div></div>
+      <div class="bar-track" title="虚线表示月均销售额">
+        <div class="bar-fill" style="width:${Math.max(2, m.sales / maxSales * 100)}%"></div>
+        <div class="avg-line" style="left:${averageLine}%"></div>
+      </div>
       <span>${symbol}${fmt.format(m.sales)}</span>
     </div>`).join("");
   return `
@@ -215,7 +407,7 @@ function renderAnalysisCard(item) {
       <header>
         <div>
           <h3>${escapeHtml(item.category_name_zh)}</h3>
-          <p class="small">${escapeHtml(item.country)}｜原始类目：${escapeHtml(item.category_key)}</p>
+          <p class="small">${escapeHtml(item.country)}｜类目：${escapeHtml(analysisCategoryPath(item))}</p>
         </div>
         <span class="small">${escapeHtml(rowTimeRange(item))}</span>
       </header>
@@ -225,7 +417,7 @@ function renderAnalysisCard(item) {
         <span class="metric">月均销售额：${symbol}${fmt.format(item.avg_sales)}</span>
       </div>
       <div class="bars">${bars}</div>
-      <p class="small">${escapeHtml(item.completeness_note || "阶段性结论")}</p>
+      <p class="small">${escapeHtml(formatCompletenessNote(item))}</p>
     </article>`;
 }
 
@@ -292,17 +484,13 @@ function renderKnowledgeFilters(kind) {
   const categoryKey = `${kind}Category`;
   const categories = getCategoriesForKind(kind);
   const categoryLabel = kind === "wisdom" ? "全部一级类目" : "全部三级类目";
-  const timeRangeSelect = kind === "analysis" ? `
-    <select data-filter="analysisTimeRange">
-      <option value="">全部时间范围</option>
-      ${timeRangeOptions(state.analysis).map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}
-    </select>` : "";
+  const timeRangeFilter = kind === "analysis" ? `<div class="filter-range-wrap">${timeRangeSliderHtml("analysis")}</div>` : "";
   container.innerHTML = `
     <select data-filter="${countryKey}">
       <option value="">全部国家</option>
       ${sortCountries(state.countries).map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
     </select>
-    ${timeRangeSelect}
+    ${timeRangeFilter}
     <select data-filter="${categoryKey}">
       <option value="">${categoryLabel}</option>
       ${categories.map(c => `<option value="${escapeHtml(c.key)}">${escapeHtml(c.name)}｜${escapeHtml(c.key)}</option>`).join("")}
@@ -310,8 +498,6 @@ function renderKnowledgeFilters(kind) {
     ${kind === "merchant" ? `<input data-filter="merchantKeyword" placeholder="搜索店铺/公司名称">` : ""}`;
   container.querySelector(`[data-filter="${countryKey}"]`).value = filters[countryKey] || "";
   container.querySelector(`[data-filter="${categoryKey}"]`).value = filters[categoryKey] || "";
-  const timeRange = container.querySelector('[data-filter="analysisTimeRange"]');
-  if (timeRange) timeRange.value = filters.analysisTimeRange || "";
   const keyword = container.querySelector('[data-filter="merchantKeyword"]');
   if (keyword) keyword.value = filters.merchantKeyword || "";
 }
@@ -404,12 +590,11 @@ function matchesCategoryCascade(row, kind) {
 function filterRows(rows, kind) {
   const country = filters[`${kind}Country`];
   const category = filters[`${kind}Category`];
-  const timeRange = kind === "analysis" ? filters.analysisTimeRange : "";
   const keyword = String(filters.merchantKeyword || "").trim().toLowerCase();
   return rows.filter(row => {
     const baseOk = (!country || row.country === country) &&
       (!category || row.category_key === category) &&
-      (!timeRange || rowTimeRange(row) === timeRange);
+      (kind !== "analysis" || timeRangeMatches(row));
     if (!baseOk) return false;
     if (kind !== "merchant" || !keyword) return true;
     return String(row.seller_name || "").toLowerCase().includes(keyword) || String(row.company_name || "").toLowerCase().includes(keyword);
@@ -426,7 +611,7 @@ function renderAnalysisTable() {
         <span>${escapeHtml(item.country)}｜${escapeHtml(item.category_name_zh)}<br><small>${escapeHtml(item.category_key)}</small></span>
         <span>${escapeHtml(rowTimeRange(item))}<br>高峰 ${escapeHtml(peakText(item.peak_months))}</span>
         <span>${symbol}${item.price_low.toFixed(2)} - ${symbol}${item.price_high.toFixed(2)}</span>
-        <span>${escapeHtml(item.completeness_note || "")}</span>
+        <span>${escapeHtml(formatCompletenessNote(item))}</span>
         <span></span>
       </div>`;
       }).join("") || `<p class="small">没有匹配结果。</p>`}
@@ -524,18 +709,18 @@ function escapeHtml(text) {
 document.getElementById("prevMonth").addEventListener("click", () => { viewDate.setMonth(viewDate.getMonth() - 1); loadState(); });
 document.getElementById("nextMonth").addEventListener("click", () => { viewDate.setMonth(viewDate.getMonth() + 1); loadState(); });
 document.getElementById("todayMonth").addEventListener("click", () => { viewDate = new Date(); loadState(); });
-document.getElementById("timeRangeFilter").addEventListener("change", event => {
-  filters.homeTimeRange = event.target.value;
-  renderAnalysis();
-});
 document.getElementById("homeCountryFilter").addEventListener("change", event => {
   filters.homeCountry = event.target.value;
-  renderTimeRangeFilter();
   renderAnalysis();
 });
 document.getElementById("rootCategoryFilter").addEventListener("change", event => {
   filters.rootCategory = event.target.value;
   renderAll();
+});
+
+document.addEventListener("input", event => {
+  if (!event.target.dataset.rangeHandle) return;
+  handleTimeRangeInput(event.target);
 });
 
 document.getElementById("chatForm").addEventListener("submit", async event => {
