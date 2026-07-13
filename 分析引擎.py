@@ -2261,6 +2261,31 @@ def search_terms(message):
     return cleaned[:24]
 
 
+def chat_intents(message):
+    text = str(message or "")
+    intents = set()
+    if re.search(r"分析结论库|分析结论|销售高峰|高峰月|高峰|价格带|备货|热销|卖得好|什么时候", text):
+        intents.add("analysis")
+    if re.search(r"商家资源库|商家库|商家|店铺|公司|厂家|供应商|联系方式|联系电话|电话|邮箱", text):
+        intents.add("merchants")
+    if re.search(r"运营智慧库|智慧库|知识库|规律|反常识|消费习惯|产业链|人工结论|经验", text):
+        intents.add("wisdom")
+    if re.search(r"原始数据库|原始数据|数据湖|上传文件|上传数据|文件|月份清单", text):
+        intents.add("raw")
+    if re.search(r"日历|节日|节庆|提醒|假日", text):
+        intents.add("calendar")
+    return intents or {"analysis", "wisdom", "merchants"}
+
+
+def is_source_overview_query(message, intents):
+    text = str(message or "")
+    if not re.search(r"库|数据库|数据湖|日历|节日|提醒|商家资源|运营智慧", text):
+        return False
+    if re.search(r"什么时候|高峰|价格带|备货|热销|卖得好|联系方式|联系|电话|邮箱", text):
+        return False
+    return bool(intents & {"merchants", "wisdom", "raw", "calendar", "analysis"})
+
+
 def matches_terms(row_text, terms):
     text = str(row_text or "").lower()
     return any(term.lower() in text for term in terms)
@@ -2429,12 +2454,16 @@ def excluded_by_terms(item, excludes):
 
 def make_chat_context(message):
     terms = search_terms(message)
+    intents = chat_intents(message)
+    source_overview = is_source_overview_query(message, intents)
     detected_country, country_source = get_context_country_info(message)
+    if source_overview and not detect_country(message):
+        detected_country, country_source = "", "missing"
     category_resolution = category_tree_resolution(message)
     recent = get_recent_chat_context()
     category_scope = category_resolution.get("scope") if category_resolution.get("status") == "ok" else None
     category_source = "explicit" if category_scope else ""
-    if not category_scope and recent.get("category_scope") and category_resolution.get("status") in ("missing", None):
+    if not source_overview and not category_scope and recent.get("category_scope") and category_resolution.get("status") in ("missing", None):
         category_scope = recent["category_scope"]
         category_source = "context"
         terms.extend([category_scope.get("value", ""), category_scope.get("l1", ""), category_scope.get("l2", ""), category_scope.get("l3", "")])
@@ -2451,6 +2480,8 @@ def make_chat_context(message):
         "category_resolution": category_resolution,
         "year_scope": year_scope,
         "analysis_scope": analysis_scope,
+        "intents": sorted(intents),
+        "source_overview": source_overview,
         "enumerate": is_enumeration_query(message),
         "country_overview": is_country_overview_query(message, detected_country, category_scope),
         "excludes": excluded_category_terms(message),
@@ -2467,6 +2498,8 @@ def make_chat_context(message):
 
 def search_analysis_source(context):
     if not context["terms"]:
+        return []
+    if context.get("source_overview") and "analysis" not in context.get("intents", set()):
         return []
     hits = []
     comparison_keys = set()
@@ -2487,7 +2520,13 @@ def search_analysis_source(context):
                 item["peak_months"].__repr__(),
             ])
             score = score_terms(text, context["terms"])
-            if score >= 2 or context.get("category_source") == "context" or (context["enumerate"] and context["category_scope"]) or context["country_overview"]:
+            if (
+                score >= 2
+                or context.get("category_source") == "context"
+                or (context["enumerate"] and context["category_scope"])
+                or context["country_overview"]
+                or (context.get("source_overview") and "analysis" in context.get("intents", set()))
+            ):
                 hits.append((score, item))
                 if desired_scope == "all":
                     comparison_keys.add((item["country"], item["category_key"]))
@@ -2562,7 +2601,11 @@ def search_merchant_source(context):
                 "seller_location", "seller_info", "category_key", "category_name_zh", "category_l1_zh", "category_l2_zh", "category_l3_zh", "notes",
             ])
             score = score_terms(text, context["terms"])
-            if score >= 2 or (context["enumerate"] and context["category_scope"]):
+            if (
+                score >= 2
+                or (context["enumerate"] and context["category_scope"])
+                or (context.get("source_overview") and "merchants" in context.get("intents", set()))
+            ):
                 hits.append((score, item))
     return [item for _, item in sorted(hits, key=lambda pair: pair[0], reverse=True)[:15]]
 
@@ -2584,24 +2627,87 @@ def search_wisdom_source(context):
                 continue
             text = " ".join(str(item.get(key, "")) for key in ["country", "category_key", "category_name_zh", "title", "content", "keywords"])
             score = score_terms(text, context["terms"])
-            if score >= 2:
+            if score >= 2 or (context.get("source_overview") and "wisdom" in context.get("intents", set())):
                 hits.append((score, item))
     return [item for _, item in sorted(hits, key=lambda pair: pair[0], reverse=True)[:10]]
+
+
+def search_raw_source(context):
+    if not context["terms"]:
+        return {"files": [], "rows": []}
+    file_hits = []
+    row_hits = []
+    with get_conn() as conn:
+        for row in conn.execute("SELECT * FROM raw_files ORDER BY imported_at DESC, year DESC, month DESC LIMIT 500"):
+            item = dict(row)
+            if context["country"] and item["country"] != context["country"]:
+                continue
+            text = " ".join(str(item.get(key, "")) for key in ["country", "year", "month", "file_name", "notes"])
+            score = score_terms(text, context["terms"])
+            if score >= 2 or (context.get("source_overview") and "raw" in context.get("intents", set())):
+                file_hits.append((score, item))
+        for row in conn.execute(
+            """
+            SELECT country, year, month, title, brand, minor_category, category_l1_zh, category_l2_zh, category_l3_zh, seller, sales, units
+            FROM sales_rows
+            ORDER BY sales DESC
+            LIMIT 2000
+            """
+        ):
+            item = dict(row)
+            if context["country"] and item["country"] != context["country"]:
+                continue
+            if not in_category_scope(item, context["category_scope"]) or excluded_by_terms(item, context["excludes"]):
+                continue
+            text = " ".join(str(item.get(key, "")) for key in [
+                "country", "year", "month", "title", "brand", "minor_category",
+                "category_l1_zh", "category_l2_zh", "category_l3_zh", "seller",
+            ])
+            score = score_terms(text, context["terms"])
+            if score >= 3 or (context["enumerate"] and context["category_scope"]):
+                row_hits.append((score, item))
+    return {
+        "files": [item for _, item in sorted(file_hits, key=lambda pair: (pair[0], pair[1].get("imported_at", "")), reverse=True)[:20]],
+        "rows": [item for _, item in sorted(row_hits, key=lambda pair: pair[0], reverse=True)[:20]],
+    }
+
+
+def search_holiday_source(context):
+    if not context["terms"]:
+        return []
+    hits = []
+    with get_conn() as conn:
+        for row in conn.execute("SELECT * FROM holidays ORDER BY start_date"):
+            item = dict(row)
+            if context["country"] and item["country"] != context["country"]:
+                continue
+            text = " ".join(str(item.get(key, "")) for key in ["country", "year", "start_date", "name_cn", "name_local", "kind", "consumer_note"])
+            score = score_terms(text, context["terms"])
+            if score >= 2 or (context.get("source_overview") and "calendar" in context.get("intents", set())):
+                hits.append((score, item))
+    return [item for _, item in sorted(hits, key=lambda pair: (pair[0], pair[1].get("start_date", "")), reverse=True)[:20]]
 
 
 def fuzzy_search_all(message):
     context = make_chat_context(message)
     if not context["terms"]:
         return context
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {
             "analysis": pool.submit(search_analysis_source, context),
             "wisdom": pool.submit(search_wisdom_source, context),
             "merchants": pool.submit(search_merchant_source, context),
+            "raw": pool.submit(search_raw_source, context),
+            "holidays": pool.submit(search_holiday_source, context),
         }
         for key, future in futures.items():
-            context[key] = future.result()
-    if not context["analysis"] and context.get("category_scope"):
+            result = future.result()
+            if key == "raw":
+                context["raw_files"] = result["files"]
+                context["raw_rows"] = result["rows"]
+            else:
+                context[key] = result
+    if not context["analysis"] and context.get("category_scope") and "analysis" in context.get("intents", set()) and not context.get("source_overview"):
         context["similar_analysis"] = search_similar_category_analysis(context)
     return context
 
@@ -2663,10 +2769,27 @@ def build_context_prompt(message, context):
         lines.append("（无相关记录）")
 
     lines.append("")
+    lines.append("【原始数据库检索结果】")
+    for item in context.get("raw_files", []):
+        lines.append(f"- 文件：{item['file_name']}，国家：{item['country']}，月份：{item.get('year')}-{int(item.get('month') or 0):02d}，导入行数：{item.get('imported_rows') or item.get('row_count') or 0}")
+    for item in context.get("raw_rows", [])[:8]:
+        category = item.get("category_l3_zh") or category_zh(item.get("minor_category"))
+        lines.append(f"- 明细：{item['country']} {item['year']}年{item['month']}月，类目：{category}，商品：{item.get('title') or '未命名'}，卖家：{item.get('seller') or '未知'}，销售额：{item.get('sales') or 0:.2f}")
+    if not context.get("raw_files") and not context.get("raw_rows"):
+        lines.append("（无相关记录）")
+
+    lines.append("")
+    lines.append("【日历/节日检索结果】")
+    for item in context.get("holidays", []):
+        lines.append(f"- 国家：{item['country']}，日期：{item['start_date']}，节日：{item['name_cn']}，消费习惯：{item.get('consumer_note') or '待补充'}")
+    if not context.get("holidays"):
+        lines.append("（无相关记录）")
+
+    lines.append("")
     lines.append("【用户的问题】")
     lines.append(message)
     lines.append("")
-    lines.append("请基于以上所有本地检索结果，综合回答用户的问题。规则：1）用户未指定年份时，优先使用“全部时间”结论，并说明基于哪个时间范围；2）如果有同国家同类目的多年份结论，要比较各年份高峰月并给出综合建议；3）如果只有相近商品结论，必须说明当前商品暂无直接数据，只能参考同二级类目商品；4）回答要自然、有逻辑层次，尽量覆盖核心结论、原因解释、商家资源、数据依据；5）没有相关记录的数据源不要生硬提及；6）严禁自行编造具体销售额数字、具体高峰月份、具体价格带和商家联系方式。")
+    lines.append("请基于以上所有本地检索结果，综合回答用户的问题。规则：1）先分辨用户主要问的是销售分析、商家资源、运营智慧、原始数据还是日历节日；2）用户未指定年份时，优先使用“全部时间”结论，并说明基于哪个时间范围；3）如果有同国家同类目的多年份结论，要比较各年份高峰月并给出综合建议；4）如果只有相近商品结论，必须说明当前商品暂无直接数据，只能参考同二级类目商品；5）回答要自然、有逻辑层次，尽量覆盖核心结论、原因解释、商家资源、数据依据；6）没有相关记录的数据源不要生硬提及；7）严禁自行编造具体销售额数字、具体高峰月份、具体价格带和商家联系方式。")
     return "\n".join(lines)
 
 
@@ -2697,7 +2820,7 @@ def ask_deepseek(message, context):
 
 
 def context_has_results(context):
-    return any(context.get(key) for key in ("analysis", "similar_analysis", "merchants", "wisdom"))
+    return any(context.get(key) for key in ("analysis", "similar_analysis", "merchants", "wisdom", "raw_rows", "raw_files", "holidays"))
 
 
 def peak_months_text(item):
@@ -2758,17 +2881,29 @@ def local_answer(context, message):
         parts.append(f"该商品/类目暂无直接分析数据，只能先参考同属「{l2}」下的相近三级类目。")
         parts.append(analysis_summary_text(context["similar_analysis"], context, similar=True))
     if context["merchants"]:
-        names, missing_contact = [], []
+        snippets, missing_contact = [], []
         for merchant in context["merchants"]:
-            if merchant["seller_name"] not in names:
-                names.append(merchant["seller_name"])
+            name = merchant["seller_name"]
+            if name not in [item.split("｜", 1)[0] for item in snippets]:
+                contact = merchant.get("contact") or merchant.get("email") or merchant.get("seller_location") or "联系方式待补充"
+                snippets.append(f"{name}｜{category_zh(merchant.get('category_key'))}｜{contact}")
             if not merchant.get("contact") and not merchant.get("email"):
-                missing_contact.append(merchant["seller_name"])
-        parts.append(f"商家资源库可先看：{'、'.join(names[:6])}。")
+                missing_contact.append(name)
+        parts.append(f"商家资源库匹配到：{'；'.join(snippets[:8])}。")
         if re.search(r"联系|电话|邮箱|联系方式", message) and missing_contact:
             parts.append(f"但这些商家的联系电话/邮箱尚未完整录入：{'、'.join(missing_contact[:5])}。你可以在商家资源库里手动补充。")
     if context["wisdom"]:
-        parts.append(f"运营智慧库相关内容：{context['wisdom'][0]['title']} - {context['wisdom'][0]['content'][:160]}")
+        wisdom_lines = []
+        for item in context["wisdom"][:5]:
+            country = item.get("country") or "全部国家"
+            category = item.get("category_name_zh") or item.get("category_key") or "无类目"
+            wisdom_lines.append(f"{country}｜{category}｜{item['title']}：{item['content'][:140]}")
+        parts.append("运营智慧库匹配到：\n" + "\n".join(f"- {line}" for line in wisdom_lines))
+    if context.get("raw_files"):
+        file_lines = []
+        for item in context["raw_files"][:8]:
+            file_lines.append(f"{item['country']} {item.get('year')}年{int(item.get('month') or 0)}月｜{item['file_name']}｜导入{item.get('imported_rows') or item.get('row_count') or 0}行")
+        parts.append("原始数据库匹配到文件：\n" + "\n".join(f"- {line}" for line in file_lines))
     if context.get("raw_rows"):
         if context.get("enumerate"):
             category_map = {}
@@ -2781,8 +2916,10 @@ def local_answer(context, message):
             row = context["raw_rows"][0]
             parts.append(f"原始数据湖匹配到：{row['country']} {row['year']}年{row['month']}月，{row.get('category_l3_zh') or category_zh(row.get('minor_category'))}下有商品“{row.get('title') or '未命名'}”。")
     if context.get("holidays"):
-        item = context["holidays"][0]
-        parts.append(f"日历数据匹配到：{item['country']} {item['start_date']} {item['name_cn']}，消费习惯：{item['consumer_note']}")
+        holiday_lines = []
+        for item in context["holidays"][:6]:
+            holiday_lines.append(f"{item['country']} {item['start_date']} {item['name_cn']}：{item.get('consumer_note') or '消费习惯待补充'}")
+        parts.append("日历数据匹配到：\n" + "\n".join(f"- {line}" for line in holiday_lines))
     if not parts:
         parts.append("本地数据库中暂无该信息，建议你手动更新知识库。")
     return "\n".join(parts)
@@ -2933,11 +3070,35 @@ def missing_category_data_answer(message, context):
     return ""
 
 
-def question_needs_country(message):
+def source_empty_answer(context):
+    intents = context.get("intents", set())
+    scope = context.get("category_scope") or {}
+    country = context.get("country") or "全部国家"
+    category = scope.get("l3") or scope.get("value") or "当前条件"
+    if "merchants" in intents:
+        return f"商家资源库中暂未找到{country}｜{category}的匹配商家。你可以换一个国家/类目继续查，或在商家资源库里手动补充这类商家。"
+    if "wisdom" in intents:
+        return f"运营智慧库中暂未找到{country}｜{category}的相关知识。建议把你人工深挖到的规律、产业链或节日消费信息补充进运营智慧库。"
+    if "raw" in intents:
+        return f"原始数据库中暂未找到{country}｜{category}的匹配文件或明细。建议先上传对应销售数据。"
+    if "calendar" in intents:
+        return f"日历数据中暂未找到{country}｜{category}的匹配节日或提醒。"
+    return ""
+
+
+def question_needs_country(message, context=None):
     text = str(message or "")
     if re.search(r"哪些国家|全部国家|所有国家|国家列表", text):
         return False
-    return bool(re.search(r"什么时候|高峰|热销|卖得好|备货|价格带|商家|厂家|联系方式|联系|类目|商品|数据", text))
+    if context and context.get("source_overview"):
+        return False
+    if re.search(r"什么时候|高峰|热销|卖得好|备货|价格带", text):
+        return True
+    if re.search(r"联系方式|联系|电话|邮箱", text):
+        return True
+    if re.search(r"卖.+的商家|.+商家有哪些|.+厂家|.+供应商", text):
+        return True
+    return False
 
 
 def country_required_answer():
@@ -2947,6 +3108,9 @@ def country_required_answer():
 
 def category_resolution_answer(context):
     resolution = context.get("category_resolution") or {}
+    intents = set(context.get("intents") or [])
+    if intents & {"merchants", "wisdom", "raw", "calendar"} and not (intents & {"analysis"}):
+        return ""
     if resolution.get("status") in ("ambiguous", "similar"):
         return resolution.get("message", "")
     return ""
@@ -2966,7 +3130,7 @@ def resolve_guided_message(message):
 def local_chat_answer(message):
     resolved_message = resolve_guided_message(message)
     context = fuzzy_search_all(resolved_message)
-    if not context.get("country") and question_needs_country(resolved_message):
+    if not context.get("country") and question_needs_country(resolved_message, context):
         answer = country_required_answer()
         with get_conn() as conn:
             conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('user', ?, ?)", (message, now_text()))
@@ -2979,7 +3143,11 @@ def local_chat_answer(message):
             conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('assistant', ?, ?)", (category_answer, now_text()))
         return {"answer": category_answer, "context": context}
     if not context_has_results(context):
-        answer = missing_category_data_answer(resolved_message, context)
+        answer = ""
+        if "analysis" in context.get("intents", set()) and not context.get("source_overview"):
+            answer = missing_category_data_answer(resolved_message, context)
+        if not answer and context.get("source_overview"):
+            answer = source_empty_answer(context)
         if answer:
             with get_conn() as conn:
                 conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('user', ?, ?)", (message, now_text()))
