@@ -779,6 +779,273 @@ def ensure_monthly_summary():
         rebuild_monthly_summary()
 
 
+def get_analysis_time_options(conn=None):
+    close_conn = conn is None
+    conn = conn or get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT MIN(year * 100 + month) AS min_m, MAX(year * 100 + month) AS max_m FROM monthly_category_sales"
+        ).fetchone()
+        options = []
+        if rows and rows["min_m"] and rows["max_m"]:
+            start = month_key(rows["min_m"] // 100, rows["min_m"] % 100)
+            end = month_key(rows["max_m"] // 100, rows["max_m"] % 100)
+            options.append({"value": "all", "label": f"全部时间（{start}至{end}）", "analysis_type": "all", "year": None, "data_range_start": start, "data_range_end": end})
+        years = [r["year"] for r in conn.execute("SELECT DISTINCT year FROM monthly_category_sales ORDER BY year DESC")]
+        options.extend({"value": f"year:{year}", "label": f"{year}年", "analysis_type": "year", "year": year} for year in years)
+        return options
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def analysis_cache_scope(value=None):
+    value = str(value or "all").strip()
+    if value.startswith("year:"):
+        try:
+            return "year", int(value.split(":", 1)[1])
+        except ValueError:
+            return "all", None
+    if re.fullmatch(r"\d{4}", value):
+        return "year", int(value)
+    return "all", None
+
+
+def analysis_cache_scope_value(row):
+    if row.get("analysis_type") == "year":
+        return f"year:{row.get('year')}"
+    return "all"
+
+
+def month_rows_for_cache(conn, country, category_key, analysis_type, year=None):
+    if analysis_type == "year":
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM monthly_category_sales
+            WHERE country=? AND category_key=? AND year=?
+            ORDER BY year, month
+            """,
+            (country, category_key, int(year)),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM monthly_category_sales
+            WHERE country=? AND category_key=?
+            ORDER BY year, month
+            """,
+            (country, category_key),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def top_sellers_for_cache(conn, country, category_key, peak_rows):
+    if not peak_rows:
+        return []
+    peak_numbers = [row["year"] * 100 + row["month"] for row in peak_rows]
+    placeholders = ",".join("?" for _ in peak_numbers)
+    rows = conn.execute(
+        f"""
+        SELECT seller, COALESCE(MAX(seller_location), '') AS seller_location,
+               COALESCE(MAX(seller_info), '') AS seller_info,
+               COALESCE(MAX(seller_home), '') AS seller_home,
+               SUM(sales) AS sales, SUM(units) AS units
+        FROM sales_rows
+        WHERE country = ?
+          AND (year * 100 + month) IN ({placeholders})
+          AND (minor_category = ? OR category_l3_zh = ?)
+        GROUP BY seller
+        ORDER BY sales DESC
+        LIMIT 10
+        """,
+        (country, *peak_numbers, category_key, category_key),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_analysis_cache(conn, country, category_key, analysis_type, year=None):
+    months = month_rows_for_cache(conn, country, category_key, analysis_type, year)
+    if not months:
+        return False
+    avg_sales = sum(row["sales"] or 0 for row in months) / len(months)
+    peak_rows = [row for row in months if (row["sales"] or 0) > avg_sales]
+    if not peak_rows:
+        peak_rows = [max(months, key=lambda row: row["sales"] or 0)]
+    top_sellers = top_sellers_for_cache(conn, country, category_key, peak_rows)
+    total_sales = sum(row["sales"] or 0 for row in top_sellers)
+    total_units = sum(row["units"] or 0 for row in top_sellers)
+    avg_price = total_sales / total_units if total_units else 0
+    start_month = month_key(months[0]["year"], months[0]["month"])
+    end_month = month_key(months[-1]["year"], months[-1]["month"])
+    sample_months = [
+        {"year": row["year"], "month": row["month"], "key": month_key(row["year"], row["month"]), "sales": round(row["sales"] or 0, 2), "rows": row["sample_rows"]}
+        for row in months
+    ]
+    peak_months = sorted({int(row["month"]) for row in peak_rows})
+    latest = months[-1]
+    cache_year = int(year) if analysis_type == "year" else None
+    conn.execute(
+        """
+        UPDATE analysis_cache
+        SET is_valid=0
+        WHERE country=? AND category=? AND analysis_type=?
+          AND ((year IS NULL AND ? IS NULL) OR year=?)
+        """,
+        (country, category_key, analysis_type, cache_year, cache_year),
+    )
+    conn.execute(
+        """
+        INSERT INTO analysis_cache(
+            country, category, analysis_type, year, peak_months,
+            price_range_low, price_range_high, top10_sellers,
+            data_range_start, data_range_end, calc_time, is_valid,
+            category_path, category_l1_zh, category_l2_zh, category_l3_zh,
+            sample_months, avg_sales, chart_data, completeness_note
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            country,
+            category_key,
+            analysis_type,
+            cache_year,
+            json.dumps(peak_months, ensure_ascii=False),
+            avg_price * 0.95,
+            avg_price * 1.05,
+            json.dumps(top_sellers, ensure_ascii=False),
+            start_month,
+            end_month,
+            now_text(),
+            latest.get("category_path") or "",
+            latest.get("category_l1_zh") or "",
+            latest.get("category_l2_zh") or "",
+            latest.get("category_l3_zh") or category_key,
+            json.dumps(sample_months, ensure_ascii=False),
+            avg_sales,
+            json.dumps(sample_months, ensure_ascii=False),
+            build_completeness_note(conn, country, start_month, end_month, sample_months),
+        ),
+    )
+    for seller in top_sellers:
+        if not seller["seller"]:
+            continue
+        conn.execute(
+            """
+            INSERT INTO merchant_resources(
+                country, category_key, seller_name, seller_location, seller_info, seller_home,
+                sales, units, updated_at, category_l1_zh, category_l2_zh, category_l3_zh
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(country, category_key, seller_name)
+            DO UPDATE SET sales=excluded.sales, units=excluded.units,
+                          seller_location=excluded.seller_location,
+                          seller_info=excluded.seller_info,
+                          seller_home=excluded.seller_home,
+                          updated_at=excluded.updated_at,
+                          category_l1_zh=excluded.category_l1_zh,
+                          category_l2_zh=excluded.category_l2_zh,
+                          category_l3_zh=excluded.category_l3_zh
+            """,
+            (
+                country,
+                category_key,
+                seller["seller"],
+                seller["seller_location"],
+                seller["seller_info"],
+                seller["seller_home"],
+                seller["sales"] or 0,
+                seller["units"] or 0,
+                now_text(),
+                latest.get("category_l1_zh") or "",
+                latest.get("category_l2_zh") or "",
+                latest.get("category_l3_zh") or category_key,
+            ),
+        )
+    return True
+
+
+def refresh_analysis_cache(country, category_keys):
+    category_keys = sorted({key for key in (category_keys or []) if key})
+    if not country or not category_keys:
+        return {"ok": True, "updated": 0, "categories": []}
+    updated = 0
+    with get_conn() as conn:
+        for category_key in category_keys:
+            years = [
+                row["year"]
+                for row in conn.execute(
+                    "SELECT DISTINCT year FROM monthly_category_sales WHERE country=? AND category_key=? ORDER BY year",
+                    (country, category_key),
+                )
+            ]
+            for year in years:
+                if upsert_analysis_cache(conn, country, category_key, "year", year):
+                    updated += 1
+            if upsert_analysis_cache(conn, country, category_key, "all"):
+                updated += 1
+    clear_analysis_cache()
+    return {"ok": True, "updated": updated, "categories": category_keys}
+
+
+def ensure_analysis_cache(force=False):
+    with get_conn() as conn:
+        if force:
+            conn.execute("UPDATE analysis_cache SET is_valid=0")
+        active_count = conn.execute("SELECT COUNT(*) AS n FROM analysis_cache WHERE is_valid=1").fetchone()["n"]
+        summary_count = conn.execute("SELECT COUNT(*) AS n FROM monthly_category_sales").fetchone()["n"]
+        if active_count and not force:
+            return {"ok": True, "rebuilt": 0, "message": "analysis_cache 已存在有效缓存"}
+        if not summary_count:
+            return {"ok": True, "rebuilt": 0, "message": "暂无月度汇总数据"}
+        combos = conn.execute(
+            """
+            SELECT DISTINCT country, category_key
+            FROM monthly_category_sales
+            WHERE country <> '' AND category_key <> ''
+            ORDER BY country, category_key
+            """
+        ).fetchall()
+    rebuilt = 0
+    for row in combos:
+        rebuilt += refresh_analysis_cache(row["country"], [row["category_key"]]).get("updated", 0)
+    return {"ok": True, "rebuilt": rebuilt, "combos": len(combos)}
+
+
+def refresh_analysis_cache_scope(analysis_type="all", year=None):
+    analysis_type = "year" if analysis_type == "year" else "all"
+    updated = 0
+    with get_conn() as conn:
+        if analysis_type == "year":
+            combos = conn.execute(
+                """
+                SELECT DISTINCT country, category_key
+                FROM monthly_category_sales
+                WHERE country <> '' AND category_key <> '' AND year=?
+                ORDER BY country, category_key
+                """,
+                (int(year),),
+            ).fetchall()
+            for row in combos:
+                if upsert_analysis_cache(conn, row["country"], row["category_key"], "year", int(year)):
+                    updated += 1
+        else:
+            combos = conn.execute(
+                """
+                SELECT DISTINCT country, category_key
+                FROM monthly_category_sales
+                WHERE country <> '' AND category_key <> ''
+                ORDER BY country, category_key
+                """
+            ).fetchall()
+            for row in combos:
+                if upsert_analysis_cache(conn, row["country"], row["category_key"], "all"):
+                    updated += 1
+    clear_analysis_cache()
+    return {"ok": True, "updated": updated}
+
+
 def normalize_existing_sales_categories():
     with get_conn() as conn:
         rows = conn.execute(
@@ -992,6 +1259,7 @@ def seed_initial_data():
         rebuild_monthly_summary()
         rebuild_analysis()
     ensure_monthly_summary()
+    ensure_analysis_cache()
 
 
 def rebuild_analysis(start_month=None, end_month=None, country=None):
@@ -1184,25 +1452,26 @@ def build_completeness_note(conn, country, start_month, end_month, sample_months
 
 
 def build_analysis_notifications(country, start_month, end_month, category_keys):
-    if not country or not start_month or not end_month or not category_keys:
+    if not country or not category_keys:
         return []
     notes = []
     with get_conn() as conn:
         placeholders = ",".join("?" for _ in category_keys)
         rows = conn.execute(
             f"""
-            SELECT country, time_range_start, time_range_end, category_key, peak_months, price_low, price_high, completeness_note
-            FROM analysis_conclusions
-            WHERE country=? AND time_range_start=? AND time_range_end=? AND category_key IN ({placeholders})
-            ORDER BY category_key
+            SELECT *
+            FROM analysis_cache
+            WHERE is_valid=1 AND analysis_type='all'
+              AND country=? AND category IN ({placeholders})
+            ORDER BY category
             """,
-            (country, start_month, end_month, *category_keys),
+            (country, *category_keys),
         ).fetchall()
         for row in rows[:8]:
-            peaks = "、".join(format_peak_month(item, row["time_range_start"]) for item in json.loads(row["peak_months"]))
+            peaks = "、".join(f"{int(month)}月" for month in json.loads(row["peak_months"]))
             symbol = currency_symbol(row["country"])
             warning = " 数据量较少，建议扩大时间范围。" if "数据量较少" in (row["completeness_note"] or "") else ""
-            notes.append(f"{row['country']}-{category_zh(row['category_key'])}（{row['time_range_start']} 至 {row['time_range_end']}）分析完成：高峰月 {peaks}，价格带 {symbol}{row['price_low']:.2f}-{symbol}{row['price_high']:.2f}，已写入知识库。{warning}")
+            notes.append(f"{row['country']}-{category_zh(row['category'])}（全部时间：{row['data_range_start']}至{row['data_range_end']}）分析完成：高峰月 {peaks}，价格带 {symbol}{row['price_range_low']:.2f}-{symbol}{row['price_range_high']:.2f}，已写入知识库。{warning}")
     if len(category_keys) > len(notes):
         notes.append(f"{country}-{start_month} 至 {end_month}，{len(category_keys)}个类目分析完成，已写入知识库。")
     return notes
@@ -1254,23 +1523,22 @@ def get_calendar_markers(year, month):
                     "title": row["name_cn"],
                     "detail": f"{row['country']}｜{row['name_local']}｜{detail}",
                 })
-        for row in conn.execute("SELECT * FROM analysis_conclusions"):
+        for row in conn.execute("SELECT * FROM analysis_cache WHERE is_valid=1 AND analysis_type='year'"):
             peaks = json.loads(row["peak_months"])
-            for peak in peaks:
-                peak_year = int(peak.get("year") or row["year"] or str(row["time_range_start"] or year)[:4])
-                target = date(peak_year, int(peak["month"]), 1)
+            for peak_month in peaks:
+                target = date(int(row["year"]), int(peak_month), 1)
                 reminder_date = target - timedelta(days=120)
                 marker_date = date(reminder_date.year, reminder_date.month, 1)
                 if marker_date.year == year and marker_date.month == month:
                     symbol = currency_symbol(row["country"])
-                    price_text = "" if row["source"] == "运营智慧" else f"｜价格带 {symbol}{row['price_low']:.2f}-{symbol}{row['price_high']:.2f}"
+                    price_text = f"｜价格带 {symbol}{row['price_range_low']:.2f}-{symbol}{row['price_range_high']:.2f}"
                     markers.append({
                         "type": "sales",
                         "color": "orange",
                         "country": row["country"],
                         "date": marker_date.isoformat(),
-                        "title": f"{category_zh(row['category_key'])}备货提醒",
-                        "detail": f"{row['country'] or '全部国家'}｜{category_zh(row['category_key'])}｜目标高峰：{target.year}年{target.month}月{price_text}｜来源：{row['source'] or '销售数据'}",
+                        "title": f"{category_zh(row['category'])}备货提醒",
+                        "detail": f"{row['country'] or '全部国家'}｜{category_zh(row['category'])}｜目标高峰：{target.year}年{target.month}月{price_text}｜来源：分析缓存",
                     })
     return sorted(markers, key=lambda x: (x["date"], x["color"], x["title"]))
 
@@ -1295,10 +1563,9 @@ def get_active_reminders(today=None):
                     "title": f"{row['country']} {row['name_cn']}",
                     "detail": row["consumer_note"],
                 })
-        for row in conn.execute("SELECT * FROM analysis_conclusions"):
-            for peak in json.loads(row["peak_months"]):
-                peak_year = int(peak.get("year") or row["year"] or str(row["time_range_start"] or today.year)[:4])
-                target = date(peak_year, int(peak["month"]), 1)
+        for row in conn.execute("SELECT * FROM analysis_cache WHERE is_valid=1 AND analysis_type='year'"):
+            for peak_month in json.loads(row["peak_months"]):
+                target = date(int(row["year"]), int(peak_month), 1)
                 reminder_start = target - timedelta(days=120)
                 reminder_end = reminder_start + timedelta(days=29)
                 if reminder_start <= today <= reminder_end:
@@ -1310,8 +1577,8 @@ def get_active_reminders(today=None):
                         "target_date": target.isoformat(),
                         "reminder_start": reminder_start.isoformat(),
                         "reminder_end": reminder_end.isoformat(),
-                        "title": f"{row['country'] or '全部国家'} {category_zh(row['category_key'])}备货提醒",
-                        "detail": f"目标高峰：{target.year}年{target.month}月；来源：{row['source'] or '销售数据'}；建议价格带 {symbol}{row['price_low']:.2f}-{symbol}{row['price_high']:.2f}",
+                        "title": f"{row['country'] or '全部国家'} {category_zh(row['category'])}备货提醒",
+                        "detail": f"目标高峰：{target.year}年{target.month}月；来源：分析缓存；建议价格带 {symbol}{row['price_range_low']:.2f}-{symbol}{row['price_range_high']:.2f}",
                     })
     # 用户要求“越近越下方”，因此显示时远目标在上、近目标在下。
     return sorted(reminders, key=lambda x: x["target_date"], reverse=True)
@@ -1348,37 +1615,124 @@ def decode_row(row):
     return row
 
 
-def get_analysis_range(start_month=None, end_month=None):
+def decode_cache_row(row):
+    row = dict(row)
+    peak_numbers = json.loads(row.get("peak_months") or "[]")
+    sample_months = json.loads(row.get("sample_months") or "[]")
+    chart_data = json.loads(row.get("chart_data") or "[]")
+    fallback_year = row.get("year") or int(str(row.get("data_range_start") or date.today().year)[:4])
+    peak_months = []
+    for month in peak_numbers:
+        month = int(month)
+        match = next((item for item in chart_data if int(item.get("month") or 0) == month), None)
+        peak_months.append({
+            "year": int(match.get("year") if match else fallback_year),
+            "month": month,
+            "key": month_key(match.get("year") if match else fallback_year, month),
+            "sales": round((match or {}).get("sales") or 0, 2),
+        })
+    row["category_key"] = row.pop("category")
+    row["year"] = row.get("year") or int(str(row.get("data_range_start") or date.today().year)[:4])
+    row["time_range_start"] = row.get("data_range_start") or ""
+    row["time_range_end"] = row.get("data_range_end") or ""
+    row["price_low"] = row.get("price_range_low") or 0
+    row["price_high"] = row.get("price_range_high") or 0
+    row["top_sellers"] = json.loads(row.get("top10_sellers") or "[]")
+    row["sample_months"] = sample_months
+    row["chart_data"] = chart_data
+    row["peak_months"] = peak_months
+    row["created_at"] = row.get("calc_time") or ""
+    row["source"] = "销售数据缓存"
+    row["source_ref"] = f"analysis_cache:{row.get('id')}"
+    row["category_name_zh"] = category_zh(row.get("category_key"))
+    row["category_path_zh"] = path_zh(row.get("category_path", ""))
+    row["category_root"] = row.get("category_l1_zh") or ""
+    row["time_range_label"] = f"{row.get('time_range_start', '')} 至 {row.get('time_range_end', '')}"
+    row["analysis_scope_value"] = analysis_cache_scope_value(row)
+    return row
+
+
+def get_cached_analysis_rows(conn, scope_value="all"):
+    analysis_type, year = analysis_cache_scope(scope_value)
+    if analysis_type == "year":
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM analysis_cache
+            WHERE is_valid=1 AND analysis_type='year' AND year=?
+            ORDER BY country, avg_sales DESC
+            """,
+            (year,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM analysis_cache
+            WHERE is_valid=1 AND analysis_type='all'
+            ORDER BY country, avg_sales DESC
+            """
+        ).fetchall()
+    if not rows:
+        refresh_analysis_cache_scope(analysis_type, year)
+        if analysis_type == "year":
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM analysis_cache
+                WHERE is_valid=1 AND analysis_type='year' AND year=?
+                ORDER BY country, avg_sales DESC
+                """,
+                (year,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM analysis_cache
+                WHERE is_valid=1 AND analysis_type='all'
+                ORDER BY country, avg_sales DESC
+                """
+            ).fetchall()
+    return [decode_cache_row(row) for row in rows]
+
+
+def get_analysis_range(start_month=None, end_month=None, scope=None, year=None):
+    if scope is None and year:
+        scope = f"year:{year}"
     start_month = normalize_month(start_month)
     end_month = normalize_month(end_month)
     with get_conn() as conn:
+        if not scope and start_month and end_month:
+            if start_month[5:] == "01" and end_month[5:] == "12" and start_month[:4] == end_month[:4]:
+                scope = f"year:{start_month[:4]}"
+            else:
+                all_option = next((item for item in get_analysis_time_options(conn) if item["value"] == "all"), None)
+                if all_option and all_option.get("data_range_start") == start_month and all_option.get("data_range_end") == end_month:
+                    scope = "all"
+        scope = scope or "all"
+        analysis_type, scope_year = analysis_cache_scope(scope)
+        if analysis_type == "year" and scope_year:
+            start_month = f"{scope_year}-01"
+            end_month = f"{scope_year}-12"
+        elif analysis_type == "all":
+            all_option = next((item for item in get_analysis_time_options(conn) if item["value"] == "all"), None)
+            if all_option:
+                start_month = all_option.get("data_range_start") or start_month
+                end_month = all_option.get("data_range_end") or end_month
         if not start_month or not end_month:
             start_month, end_month = resolve_analysis_range(conn, start_month, end_month)
         if not start_month or not end_month:
             return {"analysis": [], "time_range_start": "", "time_range_end": "", "cache": "miss"}
         if month_int(start_month) > month_int(end_month):
             start_month, end_month = end_month, start_month
-        cache_key = (start_month, end_month)
+        cache_key = (scope,)
         if ANALYSIS_RANGE_CACHE["key"] == cache_key:
             result = dict(ANALYSIS_RANGE_CACHE["value"])
             result["cache"] = "hit"
             return result
-        rows = [
-            decode_row(r)
-            for r in conn.execute(
-                """
-                SELECT *
-                FROM analysis_conclusions
-                WHERE COALESCE(time_range_start, '') <> ''
-                  AND COALESCE(time_range_end, '') <> ''
-                  AND time_range_start <= ?
-                  AND time_range_end >= ?
-                ORDER BY time_range_end DESC, time_range_start DESC, avg_sales DESC
-                """,
-                (end_month, start_month),
-            )
-        ]
-    result = {"analysis": rows, "time_range_start": start_month, "time_range_end": end_month, "cache": "miss"}
+        rows = get_cached_analysis_rows(conn, scope)
+    result = {"analysis": rows, "time_range_start": start_month, "time_range_end": end_month, "scope": scope, "cache": "miss"}
     ANALYSIS_RANGE_CACHE["key"] = cache_key
     ANALYSIS_RANGE_CACHE["value"] = result
     return result
@@ -1388,6 +1742,7 @@ def get_state(year=None, month=None):
     today = date.today()
     year = int(year or today.year)
     month = int(month or today.month)
+    ensure_analysis_cache()
     with get_conn() as conn:
         files = [dict(r) for r in conn.execute("SELECT * FROM raw_files ORDER BY country, year, month, file_name")]
         file_categories = defaultdict(set)
@@ -1401,7 +1756,17 @@ def get_state(year=None, month=None):
             row["category_keys"] = keys
             row["category_names_zh"] = [category_zh(key) for key in keys]
             row["category_roots"] = sorted(file_roots.get(row["id"], set()))
-        conclusions = [decode_row(r) for r in conn.execute("SELECT * FROM analysis_conclusions ORDER BY time_range_end DESC, time_range_start DESC, avg_sales DESC")]
+        conclusions = [
+            decode_cache_row(r)
+            for r in conn.execute(
+                """
+                SELECT *
+                FROM analysis_cache
+                WHERE is_valid=1
+                ORDER BY analysis_type, year DESC, country, avg_sales DESC
+                """
+            )
+        ]
         merchants = [dict(r) for r in conn.execute("SELECT * FROM merchant_resources ORDER BY sales DESC")]
         for row in merchants:
             row["category_name_zh"] = category_zh(row["category_key"])
@@ -1413,27 +1778,22 @@ def get_state(year=None, month=None):
         tree_count = conn.execute("SELECT COUNT(*) AS n FROM category_tree").fetchone()["n"]
         category_count = tree_count or conn.execute("SELECT COUNT(*) AS n FROM categories").fetchone()["n"]
         categories = sorted(
-            {r["category_key"] for r in conn.execute("SELECT DISTINCT category_key FROM analysis_conclusions WHERE category_key <> ''")} |
+            {r["category"] for r in conn.execute("SELECT DISTINCT category FROM analysis_cache WHERE is_valid=1 AND category <> ''")} |
             {r["category_key"] for r in conn.execute("SELECT DISTINCT category_key FROM merchant_resources WHERE category_key <> ''")} |
             {r["level3_zh"] for r in conn.execute("SELECT DISTINCT level3_zh FROM category_tree WHERE level3_zh <> ''")}
         )
-        category_roots = sorted({r["category_l1_zh"] for r in conn.execute("SELECT DISTINCT category_l1_zh FROM analysis_conclusions WHERE category_l1_zh <> ''")} | {r["category_l1_zh"] for r in conn.execute("SELECT DISTINCT category_l1_zh FROM merchant_resources WHERE category_l1_zh <> ''")} | {r["level1_zh"] for r in conn.execute("SELECT DISTINCT level1_zh FROM category_tree WHERE level1_zh <> ''")})
+        category_roots = sorted({r["category_l1_zh"] for r in conn.execute("SELECT DISTINCT category_l1_zh FROM analysis_cache WHERE is_valid=1 AND category_l1_zh <> ''")} | {r["category_l1_zh"] for r in conn.execute("SELECT DISTINCT category_l1_zh FROM merchant_resources WHERE category_l1_zh <> ''")} | {r["level1_zh"] for r in conn.execute("SELECT DISTINCT level1_zh FROM category_tree WHERE level1_zh <> ''")})
         category_root_counts = {
             row["level1_zh"]: row["n"]
             for row in conn.execute("SELECT level1_zh, COUNT(*) AS n FROM category_tree WHERE level1_zh <> '' GROUP BY level1_zh")
         }
         country_values = set(SUPPORTED_COUNTRIES)
-        for table in ("sales_rows", "raw_files", "analysis_conclusions", "merchant_resources", "wisdom", "holidays", "holiday_rules"):
+        for table in ("sales_rows", "raw_files", "merchant_resources", "wisdom", "holidays", "holiday_rules"):
             country_values.update(r["country"] for r in conn.execute(f"SELECT DISTINCT country FROM {table}") if r["country"])
+        country_values.update(r["country"] for r in conn.execute("SELECT DISTINCT country FROM analysis_cache WHERE is_valid=1") if r["country"])
         countries = sorted(country_values)
-        available_months = [month_key(r["year"], r["month"]) for r in conn.execute("SELECT DISTINCT year, month FROM raw_files ORDER BY year, month")]
-        time_ranges = sorted(
-            {
-                f"{r['time_range_start']} 至 {r['time_range_end']}"
-                for r in conn.execute("SELECT DISTINCT time_range_start, time_range_end FROM analysis_conclusions WHERE COALESCE(time_range_start, '')<>'' AND COALESCE(time_range_end, '')<>''")
-            },
-            reverse=True,
-        )
+        available_months = [month_key(r["year"], r["month"]) for r in conn.execute("SELECT DISTINCT year, month FROM monthly_category_sales ORDER BY year, month")]
+        analysis_time_options = get_analysis_time_options(conn)
     return {
         "countries": countries,
         "today": today.isoformat(),
@@ -1446,7 +1806,8 @@ def get_state(year=None, month=None):
         "categories": [{"key": c, "name": category_zh(c)} for c in categories],
         "category_roots": category_roots,
         "available_months": available_months,
-        "time_ranges": time_ranges,
+        "analysis_time_options": analysis_time_options,
+        "time_ranges": [item["label"] for item in analysis_time_options],
         "category_root_counts": category_root_counts,
         "category_count": category_count,
         "active_country": CHAT_CONTEXT["country"],
@@ -1936,8 +2297,8 @@ def search_analysis_source(context):
         return []
     hits = []
     with get_conn() as conn:
-        for row in conn.execute("SELECT * FROM analysis_conclusions ORDER BY avg_sales DESC"):
-            item = decode_row(row)
+        for row in conn.execute("SELECT * FROM analysis_cache WHERE is_valid=1 ORDER BY avg_sales DESC"):
+            item = decode_cache_row(row)
             if context["country"] and item["country"] not in (context["country"], "", "全部国家"):
                 continue
             if not in_category_scope(item, context["category_scope"]) or excluded_by_terms(item, context["excludes"]):

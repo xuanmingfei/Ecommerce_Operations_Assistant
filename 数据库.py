@@ -172,6 +172,30 @@ def init_db():
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS analysis_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                country TEXT NOT NULL,
+                category TEXT NOT NULL,
+                analysis_type TEXT NOT NULL CHECK(analysis_type IN ('year', 'all')),
+                year INTEGER,
+                peak_months TEXT NOT NULL,
+                price_range_low REAL DEFAULT 0,
+                price_range_high REAL DEFAULT 0,
+                top10_sellers TEXT NOT NULL,
+                data_range_start TEXT NOT NULL,
+                data_range_end TEXT NOT NULL,
+                calc_time TEXT NOT NULL,
+                is_valid INTEGER DEFAULT 1,
+                category_path TEXT DEFAULT '',
+                category_l1_zh TEXT DEFAULT '',
+                category_l2_zh TEXT DEFAULT '',
+                category_l3_zh TEXT DEFAULT '',
+                sample_months TEXT DEFAULT '[]',
+                avg_sales REAL DEFAULT 0,
+                chart_data TEXT DEFAULT '[]',
+                completeness_note TEXT DEFAULT ''
+            );
+
             CREATE TABLE IF NOT EXISTS merchant_resources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 country TEXT NOT NULL,
@@ -194,6 +218,12 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_analysis_country_category_range
             ON analysis_conclusions(country, category_key, time_range_start, time_range_end);
+
+            CREATE INDEX IF NOT EXISTS idx_analysis_cache_lookup
+            ON analysis_cache(country, category, analysis_type, year, is_valid);
+
+            CREATE INDEX IF NOT EXISTS idx_analysis_cache_valid_type
+            ON analysis_cache(is_valid, analysis_type, year);
 
             CREATE INDEX IF NOT EXISTS idx_merchants_country_category_sales
             ON merchant_resources(country, category_key, sales);

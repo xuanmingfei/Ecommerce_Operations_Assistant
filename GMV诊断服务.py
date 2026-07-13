@@ -27,8 +27,8 @@ from 分析引擎 import (
     import_sales_file,
     import_translation_file,
     local_chat_answer,
-    month_key,
     rebuild_analysis,
+    refresh_analysis_cache,
     seed_initial_data,
     update_holiday_rule,
     update_merchant,
@@ -103,7 +103,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/analysis":
             qs = parse_qs(parsed.query)
-            self.send_json(get_analysis_range(qs.get("start", [None])[0], qs.get("end", [None])[0]))
+            self.send_json(get_analysis_range(qs.get("start", [None])[0], qs.get("end", [None])[0], qs.get("scope", [None])[0]))
             return
         if path == "/api/merchant/template":
             self.send_csv_download([["店铺名字", "公司名称", "联系电话", "邮箱", "经营地址", "主营三级类目", "备注"]], "商家批量导入模板.csv")
@@ -197,8 +197,6 @@ class Handler(BaseHTTPRequestHandler):
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
                 file_item = form["file"] if "file" in form else None
                 country = form.getfirst("country", "")
-                start_month = form.getfirst("time_range_start", "")
-                end_month = form.getfirst("time_range_end", "")
                 if file_item is None or not file_item.filename:
                     self.send_json({"ok": False, "message": "没有收到文件"}, 400)
                     return
@@ -214,15 +212,12 @@ class Handler(BaseHTTPRequestHandler):
                 tmp_path.replace(target)
                 result = import_sales_file(target, country=country, source_copy=True)
                 if result.get("ok"):
-                    uploaded_month = month_key(result["year"], result["month"]) if result.get("year") and result.get("month") else ""
-                    analysis_start = start_month or uploaded_month
-                    analysis_end = end_month or uploaded_month
-                    rebuild_result = rebuild_analysis(analysis_start, analysis_end, country=result.get("country"))
-                    result.update({k: v for k, v in rebuild_result.items() if k in ("time_range_start", "time_range_end")})
+                    cache_result = refresh_analysis_cache(result.get("country"), result.get("categories", []))
+                    result["cache_updated"] = cache_result.get("updated", 0)
                     result["notifications"] = build_analysis_notifications(
                         result.get("country"),
-                        result.get("time_range_start") or analysis_start,
-                        result.get("time_range_end") or analysis_end,
+                        "",
+                        "",
                         result.get("categories", []),
                     )
                 self.send_json(result)
