@@ -153,7 +153,7 @@ PATH_SEGMENT_ZH = {
     "Rasenpflege": "草坪护理",
 }
 
-CHAT_CONTEXT = {"country": None, "updated_at": None}
+CHAT_CONTEXT = {"country": None, "updated_at": None, "history": []}
 CONTEXT_TTL_SECONDS = 300
 TRANSLATION_CACHE = None
 CATEGORY_TREE_CACHE = None
@@ -427,20 +427,64 @@ def detect_country(message):
     return ""
 
 
-def get_context_country(message):
+def available_data_countries():
+    with get_conn() as conn:
+        countries = {
+            row["country"]
+            for row in conn.execute("SELECT DISTINCT country FROM analysis_cache WHERE is_valid=1 AND country <> ''")
+        }
+        countries.update(row["country"] for row in conn.execute("SELECT DISTINCT country FROM raw_files WHERE country <> ''"))
+    return sorted(countries)
+
+
+def get_recent_chat_context():
+    now = datetime.now()
+    history = []
+    for item in CHAT_CONTEXT.get("history", []):
+        updated_at = item.get("updated_at")
+        if updated_at and (now - updated_at).total_seconds() <= CONTEXT_TTL_SECONDS:
+            history.append(item)
+    CHAT_CONTEXT["history"] = history[-5:]
+    return CHAT_CONTEXT["history"][-1] if CHAT_CONTEXT["history"] else {}
+
+
+def remember_chat_context(context):
+    if not context.get("country") and not context.get("category_scope"):
+        return
+    item = {
+        "country": context.get("country") or "",
+        "category_scope": context.get("category_scope"),
+        "query": context.get("query") or "",
+        "updated_at": datetime.now(),
+    }
+    history = CHAT_CONTEXT.get("history", [])
+    history.append(item)
+    CHAT_CONTEXT["history"] = history[-5:]
+
+
+def get_context_country_info(message):
     detected = detect_country(message)
     now = datetime.now()
     if detected:
         CHAT_CONTEXT["country"] = detected
         CHAT_CONTEXT["updated_at"] = now
-        return detected
+        return detected, "explicit"
+    recent = get_recent_chat_context()
+    if recent.get("country"):
+        CHAT_CONTEXT["country"] = recent["country"]
+        CHAT_CONTEXT["updated_at"] = now
+        return recent["country"], "context"
     if CHAT_CONTEXT["country"] and CHAT_CONTEXT["updated_at"]:
         if (now - CHAT_CONTEXT["updated_at"]).total_seconds() <= CONTEXT_TTL_SECONDS:
             CHAT_CONTEXT["updated_at"] = now
-            return CHAT_CONTEXT["country"]
+            return CHAT_CONTEXT["country"], "context"
     CHAT_CONTEXT["country"] = None
     CHAT_CONTEXT["updated_at"] = None
-    return ""
+    return "", "missing"
+
+
+def get_context_country(message):
+    return get_context_country_info(message)[0]
 
 
 def extract_terms(query):
@@ -1490,6 +1534,26 @@ def get_holiday_wisdom(conn, country, holiday_name):
     return dict(rows[0]) if rows else None
 
 
+def sales_reminder_cache_rows(conn, target_year):
+    rows = []
+    seen = set()
+    for row in conn.execute("SELECT * FROM analysis_cache WHERE is_valid=1 AND analysis_type='year' AND year=?", (int(target_year),)):
+        for peak_month in json.loads(row["peak_months"] or "[]"):
+            key = (row["country"], row["category"], int(target_year), int(peak_month))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"row": row, "target_year": int(target_year), "peak_month": int(peak_month), "source_label": f"{target_year}年缓存"})
+    for row in conn.execute("SELECT * FROM analysis_cache WHERE is_valid=1 AND analysis_type='all'"):
+        for peak_month in json.loads(row["peak_months"] or "[]"):
+            key = (row["country"], row["category"], int(target_year), int(peak_month))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"row": row, "target_year": int(target_year), "peak_month": int(peak_month), "source_label": f"全部时间缓存（{row['data_range_start']}至{row['data_range_end']}）"})
+    return rows
+
+
 def get_calendar(year, month):
     refresh_holidays_for_years([year])
     start = date(year, month, 1)
@@ -1523,23 +1587,22 @@ def get_calendar_markers(year, month):
                     "title": row["name_cn"],
                     "detail": f"{row['country']}｜{row['name_local']}｜{detail}",
                 })
-        for row in conn.execute("SELECT * FROM analysis_cache WHERE is_valid=1 AND analysis_type='year'"):
-            peaks = json.loads(row["peak_months"])
-            for peak_month in peaks:
-                target = date(int(row["year"]), int(peak_month), 1)
-                reminder_date = target - timedelta(days=120)
-                marker_date = date(reminder_date.year, reminder_date.month, 1)
-                if marker_date.year == year and marker_date.month == month:
-                    symbol = currency_symbol(row["country"])
-                    price_text = f"｜价格带 {symbol}{row['price_range_low']:.2f}-{symbol}{row['price_range_high']:.2f}"
-                    markers.append({
-                        "type": "sales",
-                        "color": "orange",
-                        "country": row["country"],
-                        "date": marker_date.isoformat(),
-                        "title": f"{category_zh(row['category'])}备货提醒",
-                        "detail": f"{row['country'] or '全部国家'}｜{category_zh(row['category'])}｜目标高峰：{target.year}年{target.month}月{price_text}｜来源：分析缓存",
-                    })
+        for item in sales_reminder_cache_rows(conn, year):
+            row = item["row"]
+            target = date(item["target_year"], item["peak_month"], 1)
+            reminder_date = target - timedelta(days=120)
+            marker_date = date(reminder_date.year, reminder_date.month, 1)
+            if marker_date.year == year and marker_date.month == month:
+                symbol = currency_symbol(row["country"])
+                price_text = f"｜价格带 {symbol}{row['price_range_low']:.2f}-{symbol}{row['price_range_high']:.2f}"
+                markers.append({
+                    "type": "sales",
+                    "color": "orange",
+                    "country": row["country"],
+                    "date": marker_date.isoformat(),
+                    "title": f"{category_zh(row['category'])}备货提醒",
+                    "detail": f"{row['country'] or '全部国家'}｜{category_zh(row['category'])}｜目标高峰：{target.year}年{target.month}月{price_text}｜来源：{item['source_label']}",
+                })
     return sorted(markers, key=lambda x: (x["date"], x["color"], x["title"]))
 
 
@@ -1563,23 +1626,24 @@ def get_active_reminders(today=None):
                     "title": f"{row['country']} {row['name_cn']}",
                     "detail": row["consumer_note"],
                 })
-        for row in conn.execute("SELECT * FROM analysis_cache WHERE is_valid=1 AND analysis_type='year'"):
-            for peak_month in json.loads(row["peak_months"]):
-                target = date(int(row["year"]), int(peak_month), 1)
-                reminder_start = target - timedelta(days=120)
-                reminder_end = reminder_start + timedelta(days=29)
-                if reminder_start <= today <= reminder_end:
-                    symbol = currency_symbol(row["country"])
-                    reminders.append({
-                        "type": "sales",
-                        "color": "orange",
-                        "country": row["country"],
-                        "target_date": target.isoformat(),
-                        "reminder_start": reminder_start.isoformat(),
-                        "reminder_end": reminder_end.isoformat(),
-                        "title": f"{row['country'] or '全部国家'} {category_zh(row['category'])}备货提醒",
-                        "detail": f"目标高峰：{target.year}年{target.month}月；来源：分析缓存；建议价格带 {symbol}{row['price_range_low']:.2f}-{symbol}{row['price_range_high']:.2f}",
-                    })
+        for item in sales_reminder_cache_rows(conn, today.year) + sales_reminder_cache_rows(conn, today.year + 1):
+            row = item["row"]
+            peak_month = item["peak_month"]
+            target = date(item["target_year"], int(peak_month), 1)
+            reminder_start = target - timedelta(days=120)
+            reminder_end = reminder_start + timedelta(days=29)
+            if reminder_start <= today <= reminder_end:
+                symbol = currency_symbol(row["country"])
+                reminders.append({
+                    "type": "sales",
+                    "color": "orange",
+                    "country": row["country"],
+                    "target_date": target.isoformat(),
+                    "reminder_start": reminder_start.isoformat(),
+                    "reminder_end": reminder_end.isoformat(),
+                    "title": f"{row['country'] or '全部国家'} {category_zh(row['category'])}备货提醒",
+                    "detail": f"目标高峰：{target.year}年{target.month}月；来源：{item['source_label']}；建议价格带 {symbol}{row['price_range_low']:.2f}-{symbol}{row['price_range_high']:.2f}",
+                })
     # 用户要求“越近越下方”，因此显示时远目标在上、近目标在下。
     return sorted(reminders, key=lambda x: x["target_date"], reverse=True)
 
@@ -2242,6 +2306,99 @@ def detect_category_scope(message):
     return best
 
 
+def category_scope_from_tree_row(row, level=3):
+    level = int(level or 3)
+    field = {1: "category_l1_zh", 2: "category_l2_zh", 3: "category_l3_zh"}.get(level, "category_l3_zh")
+    value = row.get({1: "level1_zh", 2: "level2_zh", 3: "level3_zh"}.get(level, "level3_zh")) or row.get("level3_zh")
+    return {
+        "field": field,
+        "value": value,
+        "level": level,
+        "score": level * 100 + len(clean_text(value)),
+        "l1": row.get("level1_zh") or "",
+        "l2": row.get("level2_zh") or "",
+        "l3": row.get("level3_zh") or row.get("level2_zh") or "",
+        "path": " / ".join(part for part in [row.get("level1_zh"), row.get("level2_zh"), row.get("level3_zh") or row.get("level2_zh")] if part),
+    }
+
+
+def category_tree_resolution(message):
+    query_text = str(message or "")
+    for key, values in CATEGORY_SYNONYMS.items():
+        if key in query_text:
+            query_text += " " + " ".join(values)
+    query_clean = clean_text(query_text)
+    rows = load_category_tree_rows()
+    explicit_l1 = {
+        row.get("level1_zh")
+        for row in rows
+        if row.get("level1_zh") and clean_text(row.get("level1_zh")) in query_clean
+    }
+    exact = []
+    for row in rows:
+        for level, keys in [
+            (3, ("level3_zh", "level3_en", "level3_es", "level3_de")),
+            (2, ("level2_zh", "level2_en", "level2_es", "level2_de")),
+            (1, ("level1_zh", "level1_en", "level1_es", "level1_de")),
+        ]:
+            for key in keys:
+                alias = clean_text(row.get(key))
+                if alias and alias in query_clean:
+                    exact.append(category_scope_from_tree_row(row, level))
+                    break
+            if exact and exact[-1].get("path") == category_scope_from_tree_row(row, level).get("path"):
+                break
+    if exact:
+        max_level = max(item["level"] for item in exact)
+        exact = [item for item in exact if item["level"] == max_level]
+        if explicit_l1:
+            filtered = [item for item in exact if item.get("l1") in explicit_l1]
+            if filtered:
+                exact = filtered
+        unique = {}
+        for item in exact:
+            unique[item["path"]] = item
+        exact = list(unique.values())
+        l1_values = sorted({item.get("l1") for item in exact if item.get("l1")})
+        if max_level == 3 and len(l1_values) > 1 and not explicit_l1:
+            return {"status": "ambiguous", "options": exact[:8], "message": f"“{exact[0]['value']}”存在于多个一级类目下，请先选择：{'、'.join(item['path'] for item in exact[:5])}"}
+        return {"status": "ok", "scope": exact[0], "exact": True}
+
+    fragments = [clean_text(item) for item in meaningful_chinese_fragments(query_text)]
+    generic = {"德国", "西班牙", "美国", "什么时候", "高峰", "热销", "备货", "价格带", "商家", "联系", "数据"}
+    fragments = [item for item in fragments if item and item not in {clean_text(word) for word in generic}]
+    candidates = []
+    for row in rows:
+        aliases = [row.get("level3_zh"), row.get("level2_zh"), row.get("level1_zh")]
+        clean_aliases = [clean_text(alias) for alias in aliases if alias]
+        score = 0
+        for fragment in fragments:
+            for alias in clean_aliases:
+                if fragment in alias or alias in fragment:
+                    score = max(score, 0.72 + min(len(fragment), len(alias)) / 100)
+                else:
+                    score = max(score, SequenceMatcher(None, fragment, alias).ratio())
+        if score >= 0.62:
+            candidates.append((score, category_scope_from_tree_row(row, 3 if row.get("level3_zh") else 2)))
+    if candidates:
+        unique = {}
+        for score, item in sorted(candidates, key=lambda pair: pair[0], reverse=True):
+            unique.setdefault(item["path"], item)
+        options = list(unique.values())[:6]
+        return {"status": "similar", "options": options, "message": f"未找到精确匹配，以下为相近类目：{'、'.join(item['path'] for item in options)}。请告诉我你想查哪一个后我再继续。"}
+    return {"status": "missing", "scope": None}
+
+
+def detect_year_scope(message):
+    text = str(message or "")
+    if "今年" in text:
+        return date.today().year
+    match = re.search(r"(20\d{2})\s*年?", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def is_enumeration_query(message):
     return bool(re.search(r"还有|除了|哪些|别的|其他|全部|所有|列表", str(message or "")))
 
@@ -2272,17 +2429,33 @@ def excluded_by_terms(item, excludes):
 
 def make_chat_context(message):
     terms = search_terms(message)
-    detected_country = get_context_country(message)
-    category_scope = detect_category_scope(message)
+    detected_country, country_source = get_context_country_info(message)
+    category_resolution = category_tree_resolution(message)
+    recent = get_recent_chat_context()
+    category_scope = category_resolution.get("scope") if category_resolution.get("status") == "ok" else None
+    category_source = "explicit" if category_scope else ""
+    if not category_scope and recent.get("category_scope") and category_resolution.get("status") in ("missing", None):
+        category_scope = recent["category_scope"]
+        category_source = "context"
+        terms.extend([category_scope.get("value", ""), category_scope.get("l1", ""), category_scope.get("l2", ""), category_scope.get("l3", "")])
+    terms = [str(term).strip() for term in terms if str(term or "").strip()]
+    year_scope = detect_year_scope(message)
+    analysis_scope = f"year:{year_scope}" if year_scope else "all"
     context = {
         "query": message,
         "terms": terms,
         "country": detected_country,
+        "country_source": country_source,
         "category_scope": category_scope,
+        "category_source": category_source,
+        "category_resolution": category_resolution,
+        "year_scope": year_scope,
+        "analysis_scope": analysis_scope,
         "enumerate": is_enumeration_query(message),
         "country_overview": is_country_overview_query(message, detected_country, category_scope),
         "excludes": excluded_category_terms(message),
         "analysis": [],
+        "similar_analysis": [],
         "merchants": [],
         "wisdom": [],
         "raw_rows": [],
@@ -2296,12 +2469,16 @@ def search_analysis_source(context):
     if not context["terms"]:
         return []
     hits = []
+    comparison_keys = set()
+    desired_scope = context.get("analysis_scope") or "all"
     with get_conn() as conn:
         for row in conn.execute("SELECT * FROM analysis_cache WHERE is_valid=1 ORDER BY avg_sales DESC"):
             item = decode_cache_row(row)
             if context["country"] and item["country"] not in (context["country"], "", "全部国家"):
                 continue
             if not in_category_scope(item, context["category_scope"]) or excluded_by_terms(item, context["excludes"]):
+                continue
+            if item.get("analysis_scope_value") != desired_scope:
                 continue
             text = " ".join([
                 item["country"], str(item["year"]), item.get("time_range_label", ""), item["category_key"], item.get("category_name_zh", ""),
@@ -2310,10 +2487,62 @@ def search_analysis_source(context):
                 item["peak_months"].__repr__(),
             ])
             score = score_terms(text, context["terms"])
-            if score >= 2 or (context["enumerate"] and context["category_scope"]) or context["country_overview"]:
+            if score >= 2 or context.get("category_source") == "context" or (context["enumerate"] and context["category_scope"]) or context["country_overview"]:
                 hits.append((score, item))
+                if desired_scope == "all":
+                    comparison_keys.add((item["country"], item["category_key"]))
+        if comparison_keys:
+            for country, category_key in comparison_keys:
+                for row in conn.execute(
+                    """
+                    SELECT *
+                    FROM analysis_cache
+                    WHERE is_valid=1 AND analysis_type='year' AND country=? AND category=?
+                    ORDER BY year
+                    """,
+                    (country, category_key),
+                ):
+                    item = decode_cache_row(row)
+                    hits.append((1, item))
     limit = 60 if context["enumerate"] else 12
-    return [item for _, item in sorted(hits, key=lambda pair: pair[0], reverse=True)[:limit]]
+    seen, result = set(), []
+    for _, item in sorted(hits, key=lambda pair: (pair[1].get("analysis_scope_value") == "all", pair[0]), reverse=True):
+        key = (item["country"], item["category_key"], item.get("analysis_scope_value"))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def search_similar_category_analysis(context):
+    scope = context.get("category_scope") or {}
+    if not scope.get("l2"):
+        return []
+    desired_scope = context.get("analysis_scope") or "all"
+    hits = []
+    with get_conn() as conn:
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM analysis_cache
+            WHERE is_valid=1 AND analysis_type=?
+              AND (? IS NULL OR year=?)
+              AND category_l2_zh=?
+            ORDER BY avg_sales DESC
+            LIMIT 20
+            """,
+            ("year" if desired_scope.startswith("year:") else "all", context.get("year_scope"), context.get("year_scope"), scope["l2"]),
+        ):
+            item = decode_cache_row(row)
+            if context["country"] and item["country"] != context["country"]:
+                continue
+            if item.get("category_key") == scope.get("l3") or item.get("category_l3_zh") == scope.get("l3"):
+                continue
+            hits.append(item)
+    return hits[:8]
 
 
 def search_merchant_source(context):
@@ -2372,6 +2601,8 @@ def fuzzy_search_all(message):
         }
         for key, future in futures.items():
             context[key] = future.result()
+    if not context["analysis"] and context.get("category_scope"):
+        context["similar_analysis"] = search_similar_category_analysis(context)
     return context
 
 
@@ -2399,10 +2630,20 @@ def read_deepseek_config():
 def build_context_prompt(message, context):
     lines = ["【分析结论库检索结果】"]
     for item in context["analysis"]:
-        peaks = "、".join(format_peak_month(p, item.get("time_range_start", "")) for p in item["peak_months"])
+        peaks = peak_months_text(item)
         symbol = currency_symbol(item["country"])
-        lines.append(f"- 国家：{item['country'] or '全部国家'}，类目：{item['category_name_zh']}（{item.get('category_l1_zh', '')}/{item.get('category_l2_zh', '')}/{item.get('category_l3_zh') or item['category_key']}），时间范围：{item.get('time_range_label', '')}，高峰月：{peaks}，价格带：{symbol}{item['price_low']:.2f}-{symbol}{item['price_high']:.2f}，数据口径：{item.get('completeness_note') or '未标注'}")
+        scope = "全部时间" if item.get("analysis_scope_value") == "all" else f"{item.get('year')}年"
+        lines.append(f"- 国家：{item['country'] or '全部国家'}，类目：{item['category_name_zh']}（{item.get('category_l1_zh', '')}/{item.get('category_l2_zh', '')}/{item.get('category_l3_zh') or item['category_key']}），口径：{scope}，时间范围：{item.get('time_range_label', '')}，高峰月：{peaks}，价格带：{symbol}{item['price_low']:.2f}-{symbol}{item['price_high']:.2f}，数据口径：{compact_coverage_note(item)}")
     if not context["analysis"]:
+        lines.append("（无相关记录）")
+
+    lines.append("")
+    lines.append("【同二级类目相近商品结论】")
+    for item in context.get("similar_analysis", []):
+        peaks = peak_months_text(item)
+        symbol = currency_symbol(item["country"])
+        lines.append(f"- 国家：{item['country']}，同属二级类目：{item.get('category_l2_zh', '')}，相近三级类目：{item['category_name_zh']}，时间范围：{item.get('time_range_label', '')}，高峰月：{peaks}，价格带：{symbol}{item['price_low']:.2f}-{symbol}{item['price_high']:.2f}")
+    if not context.get("similar_analysis"):
         lines.append("（无相关记录）")
 
     lines.append("")
@@ -2425,7 +2666,7 @@ def build_context_prompt(message, context):
     lines.append("【用户的问题】")
     lines.append(message)
     lines.append("")
-    lines.append("请基于以上所有本地检索结果，综合回答用户的问题。回答要自然、有逻辑层次，尽量覆盖：核心结论、原因解释、商家资源、数据依据。没有相关记录的数据源不要在答案里生硬提及。严禁自行编造具体销售额数字、具体高峰月份、具体价格带和商家联系方式。")
+    lines.append("请基于以上所有本地检索结果，综合回答用户的问题。规则：1）用户未指定年份时，优先使用“全部时间”结论，并说明基于哪个时间范围；2）如果有同国家同类目的多年份结论，要比较各年份高峰月并给出综合建议；3）如果只有相近商品结论，必须说明当前商品暂无直接数据，只能参考同二级类目商品；4）回答要自然、有逻辑层次，尽量覆盖核心结论、原因解释、商家资源、数据依据；5）没有相关记录的数据源不要生硬提及；6）严禁自行编造具体销售额数字、具体高峰月份、具体价格带和商家联系方式。")
     return "\n".join(lines)
 
 
@@ -2456,27 +2697,66 @@ def ask_deepseek(message, context):
 
 
 def context_has_results(context):
-    return any(context.get(key) for key in ("analysis", "merchants", "wisdom"))
+    return any(context.get(key) for key in ("analysis", "similar_analysis", "merchants", "wisdom"))
+
+
+def peak_months_text(item):
+    if item.get("analysis_scope_value") == "all":
+        return "、".join(f"{int(p.get('month'))}月" for p in item.get("peak_months", []) if p.get("month"))
+    return "、".join(format_peak_month(p, item.get("time_range_start", "")) for p in item.get("peak_months", []))
+
+
+def recommended_peak_window(items):
+    months = []
+    for item in items:
+        for peak in item.get("peak_months", []):
+            try:
+                months.append(int(peak.get("month")))
+            except (TypeError, ValueError):
+                pass
+    if not months:
+        return ""
+    counts = defaultdict(int)
+    for month in months:
+        counts[month] += 1
+    top = sorted(counts, key=lambda month: (-counts[month], month))[:3]
+    return "、".join(f"{month}月" for month in top)
+
+
+def analysis_summary_text(items, context, similar=False):
+    if not items:
+        return ""
+    primary_items = items if context.get("enumerate") else items[:12]
+    grouped = defaultdict(list)
+    for item in primary_items:
+        grouped[(item["country"], item["category_key"])].append(item)
+    sections = []
+    for (_, _), group in list(grouped.items())[:8]:
+        all_item = next((item for item in group if item.get("analysis_scope_value") == "all"), None)
+        year_items = sorted([item for item in group if item.get("analysis_scope_value") != "all"], key=lambda item: item.get("year") or 0)
+        base = all_item or group[0]
+        symbol = currency_symbol(base["country"])
+        prefix = "相近参考" if similar else "本地分析结论"
+        line = f"{prefix}：{base['country']}｜{base['category_name_zh']}，基于{base.get('time_range_start')}至{base.get('time_range_end')}数据，高峰月为{peak_months_text(base)}，建议价格带为{symbol}{base['price_low']:.2f}-{symbol}{base['price_high']:.2f}。"
+        if year_items:
+            comparisons = "；".join(f"{item.get('year')}年：{peak_months_text(item)}" for item in year_items)
+            suggestion = recommended_peak_window(year_items or [base])
+            line += f" 各年份对比：{comparisons}。"
+            if suggestion:
+                line += f" 综合来看，建议重点关注{suggestion}前的备货窗口。"
+        line += f" 口径：{compact_coverage_note(base)}。"
+        sections.append(line)
+    return "\n".join(sections)
 
 
 def local_answer(context, message):
     parts = []
     if context["analysis"]:
-        items = context["analysis"] if context.get("enumerate") else context["analysis"][:1]
-        lines = []
-        for item in items[:30]:
-            peaks = "、".join(format_peak_month(p, item.get("time_range_start", "")) for p in item["peak_months"])
-            symbol = currency_symbol(item["country"])
-            price = "" if not (item.get("price_low") or item.get("price_high")) else f"，建议价格带为 {symbol}{item['price_low']:.2f}-{symbol}{item['price_high']:.2f}"
-            source = "（运营智慧）" if item.get("source") == "运营智慧" else ""
-            lines.append(f"- {item['country'] or '全部国家'}｜{item['category_name_zh']}{source}｜{item.get('time_range_label', '')}：高峰月 {peaks}{price}")
-        if len(lines) == 1:
-            parts.append("本地分析结论库显示：" + lines[0].lstrip("- "))
-        else:
-            parts.append("本地分析结论库匹配到这些结果：\n" + "\n".join(lines))
-        notes = [item.get("completeness_note") for item in items[:5] if item.get("completeness_note")]
-        if notes:
-            parts.append("口径提醒：" + "；".join(dict.fromkeys(notes)) + "。")
+        parts.append(analysis_summary_text(context["analysis"], context))
+    elif context.get("similar_analysis"):
+        l2 = (context.get("category_scope") or {}).get("l2") or "同二级类目"
+        parts.append(f"该商品/类目暂无直接分析数据，只能先参考同属「{l2}」下的相近三级类目。")
+        parts.append(analysis_summary_text(context["similar_analysis"], context, similar=True))
     if context["merchants"]:
         names, missing_contact = [], []
         for merchant in context["merchants"]:
@@ -2513,6 +2793,9 @@ def source_note(context):
     if context["analysis"]:
         latest = max((a.get("created_at") or "" for a in context["analysis"]), default="")
         sources.append(f"本地分析结论库，更新时间：{latest or '未知'}")
+    if context.get("similar_analysis"):
+        latest = max((a.get("created_at") or "" for a in context["similar_analysis"]), default="")
+        sources.append(f"本地分析结论库相近类目，更新时间：{latest or '未知'}")
     if context["wisdom"]:
         latest = max((w.get("created_at") or "" for w in context["wisdom"]), default="")
         sources.append(f"本地运营智慧库，更新时间：{latest or '未知'}")
@@ -2524,6 +2807,48 @@ def source_note(context):
     if context.get("holidays"):
         sources.append("本地日历数据")
     return "（信息来源：" + "；".join(sources or ["本地数据库暂无匹配信息"]) + "）"
+
+
+def compact_month_ranges(month_keys):
+    grouped = defaultdict(list)
+    for key in sorted(month_keys):
+        key = normalize_month(key)
+        if not key:
+            continue
+        year, month = key.split("-")
+        grouped[int(year)].append(int(month))
+    parts = []
+    for year, months in grouped.items():
+        months = sorted(set(months))
+        ranges = []
+        start = prev = months[0]
+        for month in months[1:]:
+            if month == prev + 1:
+                prev = month
+                continue
+            ranges.append(f"{start}月" if start == prev else f"{start}-{prev}月")
+            start = prev = month
+        ranges.append(f"{start}月" if start == prev else f"{start}-{prev}月")
+        parts.append(f"{year}年{'、'.join(ranges)}")
+    return "、".join(parts)
+
+
+def compact_coverage_note(item):
+    start = item.get("time_range_start") or item.get("data_range_start") or ""
+    end = item.get("time_range_end") or item.get("data_range_end") or ""
+    samples = item.get("sample_months") or []
+    observed = {
+        sample.get("key") or month_key(sample.get("year", str(start)[:4] or date.today().year), sample.get("month"))
+        for sample in samples
+        if sample.get("month")
+    }
+    expected = set(iter_months(start, end))
+    if not start or not end or not expected:
+        return item.get("completeness_note") or "数据范围未标注"
+    missing = sorted(expected - observed)
+    if not missing:
+        return f"该类目已有{format_month_key_text(start)}至{format_month_key_text(end)}完整数据"
+    return f"该类目已有{format_month_key_text(start)}至{format_month_key_text(end)}数据，但缺失{compact_month_ranges(missing)}数据"
 
 
 def ask_deepseek_guidance(message):
@@ -2598,11 +2923,32 @@ def category_topic_from_message(message):
 
 def missing_category_data_answer(message, context):
     if not re.search(r"什么时候|高峰|卖得好|热销|备货|价格带", str(message or "")):
-        return ""
+        if not context.get("category_scope"):
+            return ""
     country = context.get("country") or detect_country(message)
-    topic = category_topic_from_message(message)
+    scope = context.get("category_scope") or {}
+    topic = scope.get("l3") or scope.get("value") or category_topic_from_message(message)
     if country and topic:
         return f"尚未上传{country}{topic}类目的数据，请先上传相关销售数据。"
+    return ""
+
+
+def question_needs_country(message):
+    text = str(message or "")
+    if re.search(r"哪些国家|全部国家|所有国家|国家列表", text):
+        return False
+    return bool(re.search(r"什么时候|高峰|热销|卖得好|备货|价格带|商家|厂家|联系方式|联系|类目|商品|数据", text))
+
+
+def country_required_answer():
+    countries = available_data_countries()
+    return f"请问您想查询哪个国家？目前有{'、'.join(countries) if countries else '暂无国家'}的数据。"
+
+
+def category_resolution_answer(context):
+    resolution = context.get("category_resolution") or {}
+    if resolution.get("status") in ("ambiguous", "similar"):
+        return resolution.get("message", "")
     return ""
 
 
@@ -2620,6 +2966,18 @@ def resolve_guided_message(message):
 def local_chat_answer(message):
     resolved_message = resolve_guided_message(message)
     context = fuzzy_search_all(resolved_message)
+    if not context.get("country") and question_needs_country(resolved_message):
+        answer = country_required_answer()
+        with get_conn() as conn:
+            conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('user', ?, ?)", (message, now_text()))
+            conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('assistant', ?, ?)", (answer, now_text()))
+        return {"answer": answer, "context": context}
+    category_answer = category_resolution_answer(context)
+    if category_answer:
+        with get_conn() as conn:
+            conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('user', ?, ?)", (message, now_text()))
+            conn.execute("INSERT INTO chat_logs(role, content, created_at) VALUES ('assistant', ?, ?)", (category_answer, now_text()))
+        return {"answer": category_answer, "context": context}
     if not context_has_results(context):
         answer = missing_category_data_answer(resolved_message, context)
         if answer:
@@ -2640,6 +2998,7 @@ def local_chat_answer(message):
     CHAT_CONTEXT["suggestions"] = {}
     CHAT_CONTEXT["guidance_rounds"] = 0
     CHAT_CONTEXT["last_context"] = context
+    remember_chat_context(context)
     answer = ask_deepseek(resolved_message, context) or local_answer(context, resolved_message)
     answer = f"{answer}\n\n{source_note(context)}"
     with get_conn() as conn:

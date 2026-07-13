@@ -26,6 +26,7 @@ from 分析引擎 import (
     import_merchants_file,
     import_sales_file,
     import_translation_file,
+    ensure_analysis_cache,
     local_chat_answer,
     rebuild_analysis,
     refresh_analysis_cache,
@@ -191,6 +192,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/rebuild":
                 rebuild_analysis()
+                ensure_analysis_cache(force=True)
                 self.send_json({"ok": True})
                 return
             if parsed.path == "/api/upload":
